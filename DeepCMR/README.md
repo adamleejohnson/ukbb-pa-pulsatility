@@ -18,7 +18,6 @@ Deep Learning Application for Cardiac Magnetic Resonance Imaging
       - [nnUNet](#nnunet)
     - [Predicting and analyzing the whole UK Biobank dataset](#predicting-and-analyzing-the-whole-uk-biobank-dataset)
 
----
 
 ## Summary of Workflow
 
@@ -88,8 +87,6 @@ Project root (for data): `{deepcmr_data_root}/` Repository root (for scripts & n
     -   Input:  `predicted_niftis_nnUNet/Task618_UKBBPulmonaryArtery/cmr_lvot_20212/`
     -   Output:  `[repo]/results/nnUNet/618/`
 
----
-
 ## Summary of Jupyter Notebooks
 - **Data Preprocessing:**
   - [Convert Training Dicoms to Nifti](notebooks/data/1_convert_dicoms_to_nifti.ipynb)
@@ -101,8 +98,6 @@ Project root (for data): `{deepcmr_data_root}/` Repository root (for scripts & n
 - **Analyses:**
   - [Repeatability](notebooks/analysis/1_inter-subject-repeatability.ipynb)
   - [nnUNet_analysis](notebooks/analysis/2_nnUNet_test_analysis.ipynb)
-
----
 
 ## Details
 
