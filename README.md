@@ -5,8 +5,6 @@ Pulmonary Artery Pulsatility (CMR + Deep neural network + UK Biobank)
 ![Python](https://img.shields.io/badge/python-3670A0?style=plastic&logo=python&logoColor=ffdd54)
 
 ### Table of Contents
-- [Pulmonary Artery Pulsatility (CMR + Deep neural network + UK Biobank)](#pulmonary-artery-pulsatility-cmr--deep-neural-network--uk-biobank)
-    - [Table of Contents](#table-of-contents)
 - [Introduction](#introduction)
 - [Note on R dependencies](#note-on-r-dependencies)
 - [Project Layout](#project-layout)
