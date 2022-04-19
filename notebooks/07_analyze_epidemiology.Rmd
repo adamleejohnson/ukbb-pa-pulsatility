@@ -1,0 +1,610 @@
+# 7. Analyze epidemiology
+
+Perform epidemiologic analyses on PA pulsatility.
+
+```{r setup, include=FALSE}
+# Common setup
+source("setup.R")
+library(survival)
+
+# custom function for defining range of boxplot whiskers -- span 95% of data
+boxplot_range <- function(x) {
+  r <- quantile(x, probs = c(0.025, 0.25, 0.5, 0.75, 0.975))
+  names(r) <- c("ymin", "lower", "middle", "upper", "ymax")
+  r
+}
+```
+
+Load data:
+
+```{r load_pulsatility}
+df_merged <- arrow::read_parquet(PROJ_ROOT %//% "data/ukb_cmr_pulsatility_and_flashPCA.2021_11_19.zst.parquet")
+```
+
+## Define phenotypes
+
+Create a new data frame with all of the phenotypes/metrics that will be of interest to us. This relies heavily on the `ukbiobank` package.
+
+```{r define_phenotypes, eval=F}
+df_pheno <-
+  df_merged %>%
+  transmute(
+    f.eid,
+    Pulsatility = Pulsatility,
+    MRI_Instance = UKB_Instance,
+
+    # demographics
+    ethnicity = ukbiobank::ethnicity_self_reported(.),
+    sex = f.31.0.0.Sex,
+    age_at_mri = ukbiobank::age_at_instance_computed(., UKB_Instance),
+    age_group_at_mri = ukbiobank::convert_to_age_group(age_at_mri),
+
+    # death outcomes
+    mri_to_death_yrs = ukbiobank::years_from_instance_to_death(., UKB_Instance),
+
+    # comorbidities
+    dx_chf = ukbiobank::diagnosed_chf(., up_to_instance = UKB_Instance),
+    dx_pHTN = ukbiobank::diagnosed_pHTN(., up_to_instance = UKB_Instance),
+    dx_copd = ukbiobank::diagnosed_copd(., up_to_instance = UKB_Instance),
+    dx_htn = ukbiobank::diagnosed_htn(., up_to_instance = UKB_Instance),
+    dx_hld = ukbiobank::diagnosed_hld(., up_to_instance = UKB_Instance),
+    dx_diabetes = ukbiobank::diagnosed_diabetes(., up_to_instance = UKB_Instance),
+    dx_pe = ukbiobank::diagnosed_pulm_embolism(., up_to_instance = UKB_Instance),
+
+    # vitals
+    sbp = ukbiobank::physio_systolicBP(.,
+      up_to_instance = UKB_Instance,
+      combine_instances = "last"
+    ),
+    dbp = ukbiobank::physio_diastolicBP(.,
+      up_to_instance = UKB_Instance,
+      combine_instances = "last"
+    ),
+    height = ukbiobank::physio_height_cm(.,
+      up_to_instance = UKB_Instance,
+      combine_instances = "last"
+    ),
+    weight = ukbiobank::physio_weight_kg(.,
+      up_to_instance = UKB_Instance,
+      combine_instances = "last"
+    ),
+    bmi = ukbiobank::physio_bmi(.,
+      up_to_instance = UKB_Instance,
+      combine_instances = "last"
+    ),
+    bsa = ukbiobank::physio_bsa(.,
+      up_to_instance = UKB_Instance,
+      combine_instances = "last"
+    ),
+
+    # crp
+    crp = ukbiobank::biomarker_lookup(., f.30710.0.0.C_reactive_protein, up_to_instance = UKB_Instance)
+  )
+```
+
+Write `df_pheno` to disk:
+
+```{r save_df_pheno, eval=F}
+write_rds(
+  df_pheno,
+  ajtools::file_datestamp(PROJ_ROOT %//% "data/ukb_cmr_pulsatility_Phenotypes.rds"),
+  compress = "xz",
+  compression = 9
+)
+```
+
+Read `df_pheno`:
+
+```{r read_df_pheno}
+df_pheno <- arrow::read_parquet(PROJ_ROOT %//% "data/ukb_cmr_pulsatility_Phenotypes.2021_11_29.zst.parquet")
+```
+
+## Pulsatility by Category
+
+### Pulsatility by Age
+
+Plot pulsatility by age group as density plots:
+
+```{r fig_pulsatility_by_age, fig.asp=1/2}
+fig.06_pulsatility_by_age <-
+  df_pheno %>%
+  ggplot() +
+  aes(x = Pulsatility, fill = age_group_at_mri) +
+  geom_density(alpha = 0.7) +
+  labs(
+    # title="Pulsatility Density Plot by Age Group",
+    x = "Pulsatility",
+    y = "Density",
+    fill = "Age Group"
+  ) +
+  xlim(0, 1) +
+  theme(
+    legend.justification = c("right", "top"),
+    # legend.key.size = unit(4,"mm"),
+    legend.position = c(0.99, 0.99),
+    legend.box.margin = margin(),
+    legend.key.height = unit(0.6, "lines"),
+    legend.key.width = unit(1, "lines"),
+    legend.title = element_text(margin = margin())
+  ) +
+  scale_fill_brewer()
+
+fig.06_pulsatility_by_age
+```
+
+```{r, eval=F}
+ajtools::ggfigsave(fig.06_pulsatility_by_age, path = "figures/", aspect_ratio = 2, overwrite = T)
+```
+
+Plot pulsatility by age group as box plots with AOV:
+
+```{r fig_pulsatility_by_age_box, eval=F}
+# AOV of age group
+aov_agegroup <- TukeyHSD(aov(Pulsatility ~ age_group_at_mri, data = df_pheno))
+
+# generate violin-boxplot of pulsatilities by age group
+fig.06_pulsatility_by_age_box <-
+  df_pheno %>%
+  ggplot() +
+  aes(y = Pulsatility, x = age_group_at_mri) +
+  geom_violin(
+    fill = "gray",
+    alpha = 0.2,
+    width = 0.85,
+    adjust = 1.5,
+    size = 0.4
+  ) +
+  stat_summary(
+    fun.data = boxplot_range,
+    geom = "boxplot",
+    fill = "gray",
+    alpha = 0.3,
+    width = 0.25,
+    color = "black",
+    size = 0.4
+  ) +
+  ggsignif::geom_signif(
+    comparisons = list(
+      c(1, 2), c(2, 3), c(3, 4), c(4, 5)
+    ),
+    y_position = 0.9,
+    step_increase = -0.03,
+    extend_line = -0.02,
+    map_signif_level = T,
+    vjust = 0.5,
+    test = "t.test",
+    tip_length = 0.02,
+    textsize = 0.38 * 7.5
+  ) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+  xlab("Age Group (Years)")
+
+# save figure to disk
+ajtools::ggfigsave(fig.06_pulsatility_by_age_box, path = PROJ_ROOT %//% "figures", aspect_ratio = 2, overwrite = T)
+```
+
+### Pulsatility by Ethnicity
+
+```{r, eval=F}
+# box plot by ethnicity
+fig.06_pulsatility_by_ethnicity_box <- print(
+  df_pheno %>%
+    ggplot() +
+    aes(y = Pulsatility, x = ethnicity) +
+    geom_boxplot(
+      outlier.shape = NA,
+      varwidth = F
+    ) +
+    ylim(0, 0.7) +
+    xlab("Ethnicity")
+)
+
+# N and mean pulsatility by ethnicity
+tbl.06_mean_pulsatility_by_ethnicity <- print(
+  df_pheno %>%
+    group_by(ethnicity) %>%
+    summarize(
+      N = n(),
+      Pulsatility = mean(Pulsatility)
+    )
+)
+
+# density plot of pulsatility by ethnicity
+fig.06_pulsatility_by_ethnicity_density <- print(
+  df_pheno %>%
+    ggplot() +
+    aes(x = age_at_mri, fill = ethnicity) +
+    geom_density(alpha = 0.85) +
+    labs(
+      # title="Pulsatility Density Plot by Age Group",
+      x = "Age",
+      y = "Density",
+      fill = "Age Group"
+    ) +
+    theme(
+      legend.justification = c("right", "top"),
+      legend.position = c(0.99, 0.99)
+    )
+)
+```
+
+### Pulsatility vs sex
+
+```{r, eval=F}
+df_pheno %>%
+  ggplot() +
+  aes(x = Pulsatility, fill = sex) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Pulsatility Density Plot by Sex", x = "Pulsatility", y = "Density", fill = "Sex") +
+  xlim(0, 1.2) +
+  theme(
+    legend.justification = c("right", "top"),
+    legend.position = c(0.95, 0.95)
+  )
+```
+
+### Pulsatility vs other
+
+```{r, eval=F}
+df_pheno %>%
+  ggplot() +
+  aes(x = Pulsatility, fill = dx_chf) +
+  geom_histogram(alpha = 0.6) +
+  scale_y_log10() +
+  labs(title = "Pulsatility Density Plot by CHF Dx", x = "Pulsatility", y = "Count", fill = "") +
+  xlim(0, 1.2)
+```
+
+Pulsatility vs HTN
+
+```{r, eval=F}
+df_pheno %>%
+  ggplot() +
+  aes(x = Pulsatility, fill = dx_htn) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Pulsatility Density Plot by HTN", x = quote(Pulsatility), y = "Density", fill = "HTN Dx")
+```
+
+Pulsatility vs HLD
+
+```{r, eval=F}
+df_pheno %>%
+  ggplot() +
+  aes(x = Pulsatility, fill = dx_hld) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Pulsatility Density Plot by HLD", x = quote(Pulsatility), y = "Density", fill = "HLD Dx")
+```
+
+Pulsatility vs COPD
+
+```{r, eval=F}
+df_pheno %>%
+  ggplot() +
+  aes(x = Pulsatility, fill = dx_copd) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Pulsatility Density Plot by COPD", x = quote(Pulsatility), y = "Density", fill = "COPD Dx")
+```
+
+Pulsatility vs pHTN
+
+```{r, eval=F}
+df_pheno %>%
+  ggplot() +
+  aes(x = Pulsatility, fill = dx_pHTN) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Pulsatility Density Plot by pHTN", x = quote(Pulsatility), y = "Density", fill = "pHTN Dx")
+```
+
+Pulsatility vs PE
+
+```{r, eval=F}
+df_pheno %>%
+  ggplot() +
+  aes(x = Pulsatility, fill = dx_pe) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Pulsatility Density Plot by PE", x = quote(Pulsatility), y = "Density", fill = "PE Dx")
+```
+
+Pulsatility vs Diabetes
+
+```{r, eval=F}
+df_pheno %>%
+  ggplot() +
+  aes(x = Pulsatility, fill = dx_diabetes) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Pulsatility Density Plot by Diabetes", x = quote(Pulsatility), y = "Density", fill = "Diabetes Dx")
+```
+
+Pulsatility vs Ethnicity
+
+```{r, eval=F}
+df_pheno %>%
+  ggplot() +
+  aes(x = Pulsatility, fill = ethnicity) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Pulsatility Density Plot by White", x = quote(Pulsatility), y = "Density", fill = "White")
+```
+
+## Logistic Regressions with Comorbidities
+
+```{r define_logistic_test_vars}
+# Define a list of variables (comorbidities) that we would like to perform regression for
+logistic_test_vars <- c(
+  `Pulmonary Hypertension` = "dx_pHTN",
+  CHF = "dx_chf",
+  # Hyperlipidemia = "dx_hld",
+  COPD = "dx_copd",
+  Diabetes = "dx_diabetes",
+  `Pulmonary Embolism` = "dx_pe",
+  Hypertension = "dx_htn"
+)
+
+# perform logistic regression on each comorbidity, and store results in a list
+glm_results <- lapply(logistic_test_vars, function(var) {
+  df_pheno %>%
+    mutate(
+      is_female = sex == "Female",
+      is_white = ethnicity == "White",
+      Pulsatility = -100 * Pulsatility / 10,
+    ) %>%
+    glm(
+      data = .,
+      formula = bquote(.(as.symbol(var)) ~ age_at_mri + is_female + is_white + Pulsatility),
+      family = binomial(link = "logit")
+    )
+})
+
+# pass that list to ajtools::gg_glmforest to generate a nice forest plot/table
+fig06.comorbidities_forest <-
+  ajtools::gg_glmforest(
+    glm_results,
+    "Pulsatility",
+    label.effect_size = "OR per 0.1 reduction in pulsatility",
+    label.dependent_var = "Comorbidity",
+    plot.rel_width = 0.35
+  ) & theme(axis.text.x = element_text(size = rel(1)))
+
+plot(fig06.comorbidities_forest)
+```
+
+```{r save_forest, eval=F}
+# save forest plot to disk
+ajtools::ggfigsave(fig06.comorbidities_forest, path = PROJ_ROOT %//% "figures", aspect_ratio = 3, open = F, overwrite = T)
+```
+
+## Survival analysis
+
+Use some additional`ukbiobank::` functions to generate survival and time-to-event data to be used by the `survival` package:
+
+```{r define_survival_data}
+df_survival <-
+  df_merged %>%
+  transmute(
+    # demographics
+    is_white = ukbiobank::ethnicity_self_reported(.) == "White",
+    sex = f.31.0.0.Sex,
+    is_male = ifelse(sex == "Male", 1, 0),
+    age_at_mri = ukbiobank::age_at_instance_computed(., UKB_Instance),
+
+    # events
+    mri_to_death_yrs = ukbiobank::years_from_instance_to_death(., UKB_Instance),
+    mri_to_censor_yrs = ukbiobank::age_at_date(., "2021-04-01") - age_at_mri,
+    status = ifelse(is.na(mri_to_death_yrs), 0, 1),
+    time = ifelse(status == 0, mri_to_censor_yrs, mri_to_death_yrs),
+
+    # pulsatility
+    Pulsatility = Pulsatility,
+    pulsatility_group = fct_relevel(case_when(
+      Pulsatility >= 0.3 ~ "Pulsatility >= 30%",
+      Pulsatility < 0.3 ~ "Pulsatility < 30%",
+    ), c("Pulsatility >= 30%", "Pulsatility < 30%")),
+
+
+    # Filters
+    dx_chf = ukbiobank::diagnosed_chf(., up_to_instance = UKB_Instance),
+    dx_copd = ukbiobank::diagnosed_copd(., up_to_instance = UKB_Instance),
+    dx_diabetes = ukbiobank::diagnosed_diabetes(., up_to_instance = UKB_Instance),
+    dx_phtn = ukbiobank::diagnosed_pHTN(., up_to_instance = UKB_Instance),
+
+    # z-score
+    pulsatility_z = -z_score(df_pheno$Pulsatility),
+    age_z = z_score(df_pheno$age_at_mri),
+
+    # Aliases
+    `Male Sex` = is_male,
+    `Age at MRI (years)` = age_at_mri,
+    `Pulsatility decrease by 0.1` = -100 * Pulsatility / 10,
+  )
+
+# run the survival analysis
+surv_fit <- survfit(Surv(time, status) ~ pulsatility_group, data = df_survival)
+surv_diff <- survdiff(Surv(time, status) ~ pulsatility_group, data = df_survival)
+logrank_p <- "Logrank * \":\" ~ italic(p) == " %++% scibeautify(1 - pchisq(surv_diff$chisq, sum(surv_diff$exp > 0) - 1), sig_digits = 2, output_format = "plotmath")
+```
+
+### Kaplan-Meier curves
+
+Plot a Kaplan-Meier survival curve:
+
+```{r make_survival_curve, eval=F}
+fig.06_survival_curve <- ajtools::ggsurvplot_patchwork(
+  surv_fit,
+  axis.title.y.nudge = -40,
+  risk.table = T,
+  # cumevents = T,
+  # cumcensor = T,
+  conf.int = T,
+  palette = rev(ggsci::pal_nejm()(2)),
+  ylim = c(0.94, 1),
+  legend.labs = c("Pulsatility \U2265 0.3", "Pulsatility < 0.3"),
+  legend.title = "",
+  legend = c(0.3, 0.6),
+  xlim = c(-0.1, 6.5),
+  xlab = "Time (years)",
+  break.x.by = 1,
+  censor = F
+)
+
+# add the logrank p-value to the plot
+fig.06_survival_curve$patches$plots[[1]] <-
+  fig.06_survival_curve$patches$plots[[1]] +
+  patchwork::inset_element(
+    grid::textGrob(str2expression(logrank_p), hjust = 0, vjust = 0.5, x = 0.325, y = 0.45),
+    0, 0, 1, 1,
+    align_to = "plot"
+  )
+
+# Save the plot to disk
+ajtools::ggfigsave(fig.06_survival_curve, path = "figures/", open = T, aspect_ratio = 1.4, width = 5, overwrite = T)
+```
+
+### Cox proportional hazards
+
+Calculate parameters of a Cox proportional hazards model:
+
+```{r surv_table}
+coxph_survival <- coxph(
+  formula = Surv(time, status) ~ `Pulsatility decrease by 0.1` + `Age at MRI (years)` + `Male Sex`,
+  data = df_survival
+)
+
+# Calculate parameters of a Cox proportional hazards model with only non-CHF and non-COPD patients:
+# coxph_survival_healthy <- coxph(
+#   formula = Surv(time, status) ~ `Pulsatility decrease by 0.1` + `Age at MRI (years)` + `Male Sex`,
+#   data = df_survival %>% filter(!dx_copd & !dx_chf)
+# )
+```
+
+Output the parameters from the coxph analysis:
+
+```{r, fig.width=4, fig.height=1.5, eval=F}
+coxph_survival_tableGrob <-
+  coxph_survival %>%
+  gtsummary::tbl_regression(exponentiate = T) %>%
+  gtsummary::as_tibble() %>%
+  rename_with(~ str_replace_all(.x, fixed("**"), "")) %>%
+  rename("bolditalic(P) * bold(-value)" = "p-value") %>%
+  mutate(`HR (95% CI)` = str_replace(`HR (95% CI)`, " to ", "–")) %>%
+  gridExtra::tableGrob(
+    d = .,
+    rows = NULL,
+    theme = gridExtra::ttheme_minimal(
+      core = list(
+        fg_params = list(
+          hjust = matrix(c(0, 0.5, 0.5), nrow = nrow(.), ncol = 3, byrow = T),
+          x = matrix(c(0, 0.5, 0.5), nrow = nrow(.), ncol = 3, byrow = T)
+        )
+      ),
+      colhead = list(
+        fg_params = list(
+          hjust = c(0, 0.5, 0.5),
+          x = c(0, 0.5, 0.5),
+          parse = c(F, F, T)
+        )
+      )
+    )
+  ) %>%
+  gtable::gtable_add_grob(
+    grobs = grid::segmentsGrob(
+      y1 = unit(0, "npc"),
+      gp = grid::gpar(lwd = 2)
+    ),
+    t = 1, b = 1, l = 1, r = ncol(.)
+  )
+```
+
+This is another Cox proportional hazards model where Pulsatility is stratified, and *adjusted survival curves* are displayed
+
+```{r, eval=F, fig.width=5, fig.asp=1/1.4, eval=F}
+cox <- coxph(
+  formula = Surv(time, status) ~ pulsatility_group + age_at_mri + is_male + strata(pulsatility_group),
+  data = df_survival
+)
+ajtools::ggsurvplot_patchwork(
+  fit = survfit(cox),
+  data = df_survival,
+  axis.title.y.nudge = -20,
+  conf.int = T,
+  palette = rev(ggsci::pal_npg()(2)),
+  ylim = c(0.92, 1),
+  legend.labs = c("Pulsatility \U2265 25%", "Pulsatility < 25%"),
+  legend.title = "",
+  legend = c(0.2, 0.7),
+  xlim = c(-0.1, 6.5),
+  xlab = "Time (years)",
+  break.x.by = 1,
+  censor = F
+)
+```
+
+## Violin-boxplot of comorbidities
+
+```{r, eval=F}
+bind_rows(
+  df_pheno %>% filter(dx_copd) %>% mutate(dx = "COPD"),
+  df_pheno %>% filter(dx_diabetes) %>% mutate(dx = "DM"),
+  df_pheno %>% filter(dx_chf) %>% mutate(dx = "CHF"),
+  df_pheno %>% filter(dx_pHTN) %>% mutate(dx = "Pulm\nHTN"),
+  df_pheno %>% filter(!(dx_chf | dx_copd | dx_diabetes | dx_pHTN)) %>% mutate(dx = "Healthy"),
+) %>%
+  mutate(dx = as_factor(dx)) %>%
+  select(dx, Pulsatility) %>%
+  {
+    ggplot(.) +
+      aes(x = dx, y = Pulsatility) +
+      geom_violin(
+        fill = "gray",
+        alpha = 0.2,
+        width = 0.85,
+        adjust = 1.5,
+        size = 0.4
+      ) +
+      stat_summary(
+        fun.data = boxplot_range,
+        geom = "boxplot",
+        fill = "gray",
+        alpha = 0.3,
+        width = 0.25,
+        color = "black",
+        size = 0.4
+      ) +
+      # geom_boxplot(
+      #   outlier.shape = NA,
+      #   na.rm = T,
+      #   width = 0.25,
+      #   color = "black",
+      #   fill = "gray",
+      #   alpha = 0.3,
+      #   size = 0.4
+      # ) +
+      # ggforce::geom_sina(
+      #   data =  ~filter(.x, dx != "No\ndisease"),
+      #   maxwidth = 0.725,
+      #   seed = pi/2
+      # ) +
+      scale_y_continuous(breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+      xlab(NULL) +
+      ggsignif::geom_signif(
+        comparisons = rev(list(
+          c(1, 5), c(2, 5), c(3, 5), c(4, 5)
+        )),
+        y_position = 0.72,
+        extend_line = -0.025,
+        map_signif_level = T,
+        step_increase = 0.053,
+        tip_length = 0.02,
+        vjust = 0.6,
+        textsize = 0.38 * 7.5,
+        # parse = T
+      ) +
+      theme(
+        axis.text = element_text(
+          color = "black",
+          size = calc_element("axis.title", theme_get())$size
+        )
+      )
+  } %>%
+  ajtools::ggfigsave(name = "fig.07_comorbidities_violin", path = PROJ_ROOT %//% "figures", width = 2.5, height = 1.5, format = c("pdf", "rds"), overwrite = T, open = T)
+```
+
+

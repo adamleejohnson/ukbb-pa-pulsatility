@@ -1,0 +1,251 @@
+# 11. Activity-by-Contact analysis
+
+ABC data downloaded from ftp://ftp.broadinstitute.org/outgoing/lincRNA/ABC/Nasser2021-Full-ABC-Output/ (hg19 aligned). Make sure `bedtools` is installed.
+
+```{r setup}
+# Common setup
+source("setup.R")
+```
+
+## Export FUMA snps & loci for bedtools
+
+```{r, eval=F}
+# load FUMA results & GWAS summary stats
+gwas_analysis <- ajtools::sourceRmd(PROJ_ROOT %//% "notebooks/08_analyze_gwas_results.Rmd")
+gwas_summary <- gwas_analysis$gwas_summary
+fuma_risk_loci <- gwas_analysis$risk_loci
+cand_snps <- gwas_analysis$candidate_snps
+remove(gwas_analysis)
+
+# Convert fuma risk loci to bed file
+fuma_risk_loci %>%
+  transmute(
+    chrom = paste0("chr", chr),
+    start,
+    end
+  ) %>%
+  write_tsv(PROJ_ROOT %//% "analyses/ActivityByContact/fuma_risk_loci.bed")
+
+# Convert gwas suggestive snps to bed file
+gwas_snps <- 
+  gwas_summary %>%
+  filter(P_BOLT_LMM_INF < 1e-6) %>%
+  transmute(
+    chrom = paste0("chr", CHR),
+    start = BP,
+    end = BP,
+    snp = SNP
+  ) %>%
+  write_tsv(PROJ_ROOT %//% "analyses/ActivityByContact/gwas_suggestive_snps.bed")
+
+# Convert FUMA candidate snps to bed file
+cand_snps %>%
+  transmute(
+    chrom = paste0("chr", chr),
+    start = pos,
+    end = pos,
+    snp = rsID
+  ) %>%
+  write_tsv(PROJ_ROOT %//% "analyses/ActivityByContact/fuma_candidate_snps.bed")
+
+# Combind GWAS suggestive SNPs and FUMA candidate snps into another bed file
+bind_rows(gwas_snps, cand_snps) %>%
+  filter(!duplicated(snp)) %>%
+  write_tsv(PROJ_ROOT %//% "analyses/ActivityByContact/all_candidate_snps.bed")
+```
+
+## Define function to run bedtools
+
+```{r}
+abc_bedtools_intersect <- function(input_bed,
+                                   ABC_data,
+                                   output,
+                                   bedtools = "/opt/homebrew/bin/bedtools") {
+  
+  # make sure the bedtools executable & input bed files exist
+  stopifnot(file.exists(bedtools))
+  stopifnot(file.exists(input_bed))
+  for (f in ABC_data) stopifnot(file.exists(f))
+  
+  # print which bedtools version we are using
+  message(system2(bedtools, "--version", stdout = T))
+  
+  # validate location of ABC data
+  ABC_data <- ifelse(xfun::is_rel_path(ABC_data), getwd() %//% ABC_data, ABC_data)
+  if (xfun::is_rel_path(input_bed)) input_bed <- PROJ_ROOT %//% input_bed
+  if (xfun::is_rel_path(output)) output <- dirname(input_bed) %//% output
+  
+  # apply bedtools to each ABC data set
+  lapply(ABC_data, function(abc_data) {
+    message("Processing ", abc_data)
+    
+    # create temp output file
+    result_tmp <- tempfile(fileext = ".txt")
+    on.exit(unlink(result_tmp), add = T)
+    
+    # decompress input if compressed
+    file_ext <- xfun::file_ext(abc_data)
+    if (file_ext %in% c("gz", "xz", "zst")) {
+      abc_data_tmp <- tempfile(fileext = ".txt")
+      on.exit(unlink(abc_data_tmp), add = T)
+      message("  > Decompressing to ", abc_data_tmp)
+      switch(file_ext,
+        "gz" = system2("gzip", c("-c", "-d", abc_data, ">", abc_data_tmp)),
+        "xz" = system2("xz", c("-c", "-d", abc_data, ">", abc_data_tmp)),
+        "zst" = system2("zstd", c("-d", abc_data, "-o", abc_data_tmp))
+      )
+      abc_data <- abc_data_tmp
+    }
+    
+    # run bedtools intersect
+    message("  > Running bedtools intersect")
+    r <- system2(
+      bedtools,
+      c("intersect", "-header", "-u", "-b", input_bed, "-a", abc_data, ">", result_tmp)
+    )
+    if (r != 0) stop()
+    
+    message("  > Reading results")
+    vroom(result_tmp, show_col_types = F)
+  }) %>%
+  Reduce(bind_rows, .) %>%
+  write_tsv(output)
+}
+```
+
+## Run bedtools
+
+```{r, eval=F}
+# Define the locations of each ABC data set
+ABC_files <- 
+  PROJ_ROOT %//% "../../Archives.nosync/ABC-Output" %//%
+  c(
+    "coronary_artery_smooth_muscle_cell-Miller2016",
+    "cardiac_muscle_cell-ENCODE",
+    "coronary_artery-ENCODE",
+    "fibroblast_of_lung-Roadmap",
+    "heart_ventricle-ENCODE",
+    "endothelial_cell_of_umbilical_vein-Roadmap",
+    "IMR90-Roadmap"
+  ) %//%
+  "Predictions_AvgHiC/EnhancerPredictionsAllPutative.txt.gz"
+
+# Run bedtools intersect with the FUMA risk loci on each ABC data set
+ABC_fuma_risk_loci <- abc_bedtools_intersect(
+  input_bed = "analyses/ActivityByContact/fuma_risk_loci.bed",
+  ABC_data = ABC_files,
+  output = ajtools::file_datestamp("ABC_fuma_risk_loci.txt.gz", path = "analyses/ActivityByContact"))
+
+# ABC_gwas_suggestive_snps <- abc_bedtools_intersect(
+#   input_bed = "analyses/ActivityByContact/gwas_suggestive_snps.bed",
+#   ABC_data = ABC_files,
+#   output = ajtools::file_datestamp("ABC_gwas_suggestive_snps.txt.gz", path = "analyses/ActivityByContact"))
+# 
+# ABC_fuma_candidate_snps <- abc_bedtools_intersect(
+#   input_bed = "analyses/ActivityByContact/fuma_candidate_snps.bed",
+#   ABC_data = ABC_files,
+#   output = ajtools::file_datestamp("ABC_fuma_candidate_snps.txt.gz", path = "analyses/ActivityByContact"))
+# 
+# ABC_all_candidate_snps <- abc_bedtools_intersect(
+#   input_bed = "analyses/ActivityByContact/all_candidate_snps.bed",
+#   ABC_data = ABC_files,
+#   output = ajtools::file_datestamp("ABC_all_candidate_snps.txt.gz", path = "analyses/ActivityByContact"))
+```
+
+## Load results
+
+```{r}
+ABC_fuma_risk_loci <- read_tsv(PROJ_ROOT %//% "analyses/ActivityByContact/ABC_fuma_risk_loci.2022_01_03.txt.gz", show_col_types = F)
+# ABC_gwas_suggestive_snps <- read_tsv(PROJ_ROOT %//% "analyses/ActivityByContact/ABC_gwas_suggestive_snps.2022_01_03.txt.gz", show_col_types = F)
+# ABC_fuma_candidate_snps <- read_tsv(PROJ_ROOT %//% "analyses/ActivityByContact/ABC_fuma_candidate_snps.2022_01_03.txt.gz", show_col_types = F)
+# ABC_all_candidate_snps <- read_tsv(PROJ_ROOT %//% "analyses/ActivityByContact/ABC_all_candidate_snps.2022_01_03.txt.gz", show_col_types = F)
+```
+
+## Make table of results
+
+```{r}
+make_abc_results_table <- function(df, abc_cutoff = 0.02) {
+  nc <- 4
+  nt <- df %>% pull(CellType) %>% unique() %>% length()
+  df %>%
+    select(chr, TargetGeneTSS, TargetGene, ABC.Score, CellType) %>%
+    mutate(
+      chr = ordered(chr, levels = paste0("chr", c(1:23, "X")), labels = c(1:22, "X", "X")),
+      CellType = recode(CellType,
+        "coronary_artery_smooth_muscle_cell-Miller2016" = "Coronary SMC",
+        "coronary_artery-ENCODE" = "Coronary Artery",
+        "cardiac_muscle_cell-ENCODE" = "Cardiac Myocyte",
+        "heart_ventricle-ENCODE" = "Cardiac Ventricle", 
+        "fibroblast_of_lung-Roadmap" = "Lung Fibroblast",
+        "IMR90-Roadmap" = "IMR90",
+        "endothelial_cell_of_umbilical_vein-Roadmap" = "HUVEC",
+      )
+    ) %>%
+    group_by(chr, TargetGene, CellType) %>%
+    filter(ABC.Score == max(ABC.Score)) %>%
+    ungroup() %>%
+    distinct(TargetGene, CellType, .keep_all = T) %>%
+    group_by(chr, TargetGene) %>%
+    mutate(max_abc.score = max(ABC.Score)) %>%
+    ungroup() %>%
+    arrange(-max_abc.score, chr, TargetGeneTSS) %>%
+    pivot_wider(names_from = CellType, values_from = ABC.Score) %>%
+    filter(max_abc.score > abc_cutoff) %>%
+    select(
+      "Gene Symbol" = TargetGene,
+      "Gene\nChr" = chr,
+      "Gene\nTSS" = TargetGeneTSS,
+      "Maximum\nABC Score" = max_abc.score,
+      everything()
+    ) %>%
+    relocate("Coronary SMC", "Coronary Artery", "Cardiac Myocyte", "Cardiac Ventricle", "Lung Fibroblast", "IMR90", "HUVEC", .after = last_col()) %>%
+    flextable::flextable() %>%
+    flextable::align(j = -1, part = "all", align = "center") %>%
+    
+  # Merged header over tissues
+    flextable::add_header_row(colwidths = c(rep(1,nc),nt), values = c(.$header$col_keys[1:nc], "")) %>%
+    flextable::compose(i = 1, j = -c(1:nc), part = "header", value = as_paragraph(
+      "ABC Score by cell type"
+    )) %>%
+    flextable::merge_v(j = 1:nc, part = "header") %>%
+    flextable::hline(i = 1, j = -c(1:nc), part = "header", border = officer::fp_border(width = 1)) %>%
+    
+  # Vertical line between tissues and rest of table
+    flextable::vline(j = nc) %>%
+    
+  # Footer & Symbols
+    flextable::compose(j = "Maximum\nABC Score", part = "header", use_dot = T, value = as_paragraph(., as_sup("†"))) %>%
+    flextable::add_footer_lines(NA) %>%
+    flextable::compose(part = "footer", value = as_paragraph(
+      "Chromosomes and positions in GRCh37 coordinates. TSS = transcription start site. ABC = Activity-by-Contact.",
+      "\n",
+      as_sup("† "), "Maximum ABC Score across all cell types listed. Only those genes for which at least one cell type has an ABC score greater than ", scibeautify(abc_cutoff, 2), " are included."
+    )) %>%
+    flextable::line_spacing(part = "footer", space = 1.5) %>%
+    flextable::align(j = -1, align = "center", part = "all") %>%
+    
+  # Format ABC Score display value
+    flextable::compose(j = -c(1:(nc - 1)), part = "body", use_dot = T, value = as_paragraph(
+      case_when(
+        is.na(.) ~ "⁠–",
+        . < 0.01 ~ "< 0.01",
+        T ~ scibeautify(., 2, sci_mode = "off")
+      )
+    )) %>%
+    
+  # Color ABC Score values
+    flextable::bg(j = -c(1:nc), bg = function(x) {
+      rng <- c(abc_cutoff, max(x, na.rm = T))
+      x <- ifelse(x > abc_cutoff, x, NA)
+      x <- (as.numeric(x) - rng[1]) / (rng[2] - rng[1])
+      col_ramp_brewer("BuGn")(x)
+    })
+}
+```
+
+```{r, eval=F}
+# Save table to disk
+make_abc_results_table(ABC_fuma_risk_loci, 0.02) %>%
+  ajtools::flextable_save("table_abc_fuma_risk_loci_results", path = PROJ_ROOT %//% "figures", overwrite = T)
+```
+

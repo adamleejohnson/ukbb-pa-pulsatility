@@ -1,0 +1,281 @@
+# 4. Genetic Principal Component Analysis
+
+Genetic principal components for the GWAS were calculated using *flashPCA2*. Here, we review the workflow for generating the principal components within the cohort of CMR participants. We use the same parameters as used by the UK Biobank (reported in their supplemental QC report). We compare the PCs that we calculate within the CMR cohort to the UKB-supplied PCs calculated within the UKB population, and show that they are very similar. This should be expected, since the CMR cohort is meant to be a random sample from the UKB cohort.
+
+Adapted from FlashPCA at <https://github.com/gabraham/flashpca> and [https://doi.org/10.1093/bioinformatics/btx299](https://doi.org/10.1093/bioinformatics/btx299). Also see UK Biobank genotype QC supplementary material.
+
+```{r setup, include=FALSE}
+# Common setup
+source("setup.R")
+```
+
+## QC: Create set of SNPs from which to calculate PCs
+
+Concatenate the split chromosome files using plink2 and filter-in only the samples in the CMR study.
+
+```{bash, eval=F}
+plink2 \
+  --make-bed \
+  --pmerge-list ukb_geno_files.txt bfile \
+  --pmerge-list-dir original_geno_files \
+  --keep ukb_cmr_sample_IDs_10_2021.txt \
+  --out 0_merged_bed_filtered_sampels/ukb_cmr_pca_10_2021_merge \
+  --threads 4 \
+  --memory 8000
+```
+
+where the sample list was generated with the R command: `df_merged %>% transmute(FID = f.eid, IID = f.eid) %>% write_tsv("ukb_cmr_sample_IDs_10_2021.txt")` and `ukb_geno_files.txt` contains:
+
+    ukb_geno_chr1
+    ...
+    ukb_geno_chr22
+    ukb_geno_chrX
+
+Next, we perform QC filtering on SNPs. These are copied from the original UK Biobank QC methodology.
+
+1.  `--geno`: filters variants with missing call rates exceeding the provided threshold
+2.  `--mind`: filters samples with missing call rates exceeding the provided threshold
+3.  `--maf`: filters variants with allele frequency below the provided threshold
+4.  `--exclude range`: exclude SNPs in the range as specified in the original UK Biobank QC paper.
+
+```{bash, eval=F}
+plink2 \
+  --write-snplist \
+  --bfile 0_merged_bed_filtered_sampels/ukb_cmr_pca_10_2021_merge \
+  --maf 0.01 \
+  --geno 0.015 \
+  --mind 0.05 \
+  --exclude range exclusion_regions_ukb.txt \
+  --out 1_filtered_snps_freq/ukb_cmr_pca_10_2021 \
+  --threads 4 \
+  --memory 8000
+```
+
+where `exclusion_regions_ukb.txt` contains:
+
+    1 48000000 52000000 r1
+    2 86000000 100500000 r2
+    2 134500000 138000000 r3
+    2 183000000 190000000 r4
+    3 47500000 50000000 r5
+    3 83500000 87000000 r6
+    3 89000000 97500000 r7
+    5 44000000 51500000 r8
+    5 98000000 100500000 r9
+    5 129000000 132000000 r10
+    5 135500000 138500000 r11
+    6 25000000 33500000 r12
+    6 57000000 64000000 r13
+    6 140000000 142500000 r14
+    7 55000000 66000000 r15
+    8 8000000 12000000 r16
+    8 43000000 50000000 r17
+    10 37000000 43000000 r18
+    11 45000000 57000000 r19
+    11 87500000 90500000 r20
+    12 33000000 40000000 r21
+    12 109500000 112000000 r22
+    20 32000000 34500000 r23
+
+Next, we prune the SNPs to a set of independent markers such that pairwise $r^2$ < 0.1, using windows of 1000 base pairs (bp) and a step-size of 80 bp.
+
+```{bash, eval=F}
+plink2 \
+  --indep-pairwise 1000 80 0.1 \
+  --bfile 0_merged_bed_filtered_sampels/ukb_cmr_pca_10_2021_merge \
+  --extract 1_filtered_snps_freq/ukb_cmr_pca_10_2021.snplist \
+  --out 2_filtered_snps_LD/ukb_cmr_pca_10_2021 \
+  --threads 4 \
+  --memory 8000
+```
+
+Finally, export a `.bed` file with our filtered samples and snps.
+
+```{bash, eval=F}
+plink2 \
+  --make-bed
+  --bfile 0_merged_bed_filtered_sampels/ukb_cmr_pca_10_2021_merge \
+  --extract 2_filtered_snps_LD/ukb_cmr_pca_10_2021.snplist \
+  --out 3_filtered_geno_files/ukb_cmr_pca_10_2021 \
+  --threads 4 \
+  --memory 8000
+```
+
+## Run FlashPCA
+
+FlashPCA 2.0 was downloaded from https://github.com/gabraham/flashpca on 10/18/2021, and compiled from source with Eigen 3.4.0, Boost 1.76.0, and Spectra 0.9.0 (https://github.com/yixuan/spectra/releases/tag/v0.9.0).
+
+The output of `flashpca --version`:
+
+    [Mon Oct 18 20:06:36 2021] arguments: flashpca flashpca --version
+    flashpca 2.0
+    Copyright (C) 2014-2016 Gad Abraham.
+    This is free software; see the source for copying conditions.  There is NO
+    warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+Run `flashpca` on our filtered data file:
+
+```{bash, eval=F}
+flashpca \
+  --bfile ../3_filtered_geno_files/ukb_cmr_pca_10_2021 \
+  --suffix _ukb_cmr_10.2021.txt \
+  --numthreads 8 \
+  --memory 8192 \
+  --verbose
+```
+
+The proportion of total variance explained by each of the top 10 eigenvectors:
+
+    0.004902842
+    0.001789205
+    0.0005347056
+    0.000334843
+    0.0002063367
+    0.0001000091
+    8.871009e-05
+    8.359917e-05
+    8.193302e-05
+    7.88397e-05
+
+[Summing these, we can see that the top 10 eigenvectors account for \~0.82% of the total variance.]{.ul}
+
+Check the accuracy of the output:
+
+```{bash, eval=F}
+flashpca \
+  --bfile ../3_filtered_geno_files/ukb_cmr_pca_10_2021 \
+  --check \
+  --outvec eigenvectors_ukb_cmr_10.2021.txt \
+  --outval eigenvalues_ukb_cmr_10.2021.txt \
+  --verbose
+```
+
+    [Mon Oct 18 20:44:44 2021] eval(1): 207.022, sum squared error: 4.5212e-10
+    [Mon Oct 18 20:44:44 2021] eval(2): 75.549, sum squared error: 6.31116e-11
+    [Mon Oct 18 20:44:44 2021] eval(3): 22.5779, sum squared error: 5.59023e-12
+    [Mon Oct 18 20:44:44 2021] eval(4): 14.1387, sum squared error: 1.20521e-11
+    [Mon Oct 18 20:44:44 2021] eval(5): 8.71255, sum squared error: 1.39038e-12
+    [Mon Oct 18 20:44:44 2021] eval(6): 4.22288, sum squared error: 1.18036e-13
+    [Mon Oct 18 20:44:44 2021] eval(7): 3.74578, sum squared error: 2.81801e-13
+    [Mon Oct 18 20:44:44 2021] eval(8): 3.52997, sum squared error: 7.68822e-13
+    [Mon Oct 18 20:44:44 2021] eval(9): 3.45961, sum squared error: 2.54593e-13
+    [Mon Oct 18 20:44:44 2021] eval(10): 3.329, sum squared error: 4.64912e-13
+    [Mon Oct 18 20:44:44 2021] Mean squared error: 1.28454e-15, Root mean squared error: 3.58404e-08 (n=41739)
+    [Mon Oct 18 20:44:44 2021] Goodbye!
+
+## Merge PCs with phenotype data
+
+```{r merge_pca_with_pheno}
+pcs_flashpca <-
+  vroom(PROJ_ROOT %//% "data/pca/4_flashpca_results/pcs_ukb_cmr_10.2021.txt", show_col_types = F) %>%
+  select(-IID) %>%
+  rename(f.eid = FID) %>%
+  mutate(across(f.eid, as.character))
+
+df_merged_pca <-
+  arrow::read_parquet(PROJ_ROOT %//% "data/ukb_cmr_pulsatility_merged.2021_11_19.zst.parquet") %>%
+  left_join(pcs_flashpca, by = "f.eid")
+```
+
+Write the df merged with pca to disk.
+
+```{r write_merged_pca, eval=F}
+# write_rds(df_merged_pca, ajtools::file_datestamp("ukb_cmr_pulsatility_and_flashPCA.rds", path = "data"), compress = "xz", compression = 9)
+ajtools::write_parquet_zstd(df_merged_pca, ajtools::file_datestamp("ukb_cmr_pulsatility_and_flashPCA.rds", path = "data"), 22)
+```
+
+## Visualize PCs
+
+Load the PCs from the results of `flashpca`.
+
+We calculate the average sign of the PCs in the UKB data set so we can match the FlashPCA PCs as closely as possible to the UKB PCs. PCs are degenerate up to a sign.
+
+```{r}
+df_merged_pca <- arrow::read_parquet(PROJ_ROOT %//% "data/ukb_cmr_pulsatility_and_flashPCA.2021_11_19.zst.parquet")
+
+# Match the signs of the PCs for better visualization
+# (PCs are degenerate up to a sign change)
+for (i in 1:10) {
+  sign_factor <-
+    df_merged_pca %>%
+    mutate(
+      sign(!!as.symbol(paste0("PC", i))) * sign(!!as.symbol(paste0("f.22009.0.", i, ".Genetic_principal_components")))
+    ) %>%
+    pull() %>%
+    mean(na.rm = T) %>%
+    sign()
+  df_merged_pca %<>%
+    mutate(across(!!paste0("PC", i), ~ .x * sign_factor))
+}
+```
+
+Compare different principal components to one another.
+
+```{r viz_pcas, fig.asp=.8}
+fig.04_pca_comparisons <- patchwork:::plot_filler()
+
+for (i in 2:10) {
+  for (j in 1:9) {
+    if (j >= i) {
+      p <- patchwork::plot_spacer()
+    } else {
+      p <- ggplot(df_merged_pca) +
+        geom_point(
+          aes(
+            x = (1 / 500) * !!as.symbol(paste0("f.22009.0.", j, ".Genetic_principal_components")),
+            y = (1 / 500) * !!as.symbol(paste0("f.22009.0.", i, ".Genetic_principal_components"))
+          ),
+          color = "grey",
+          alpha = 0.5,
+          size = 1 / 2
+        ) +
+        geom_point(
+          aes(
+            x = !!as.symbol(paste0("PC", j)),
+            y = !!as.symbol(paste0("PC", i))
+          ),
+          color = "red",
+          alpha = 0.1,
+          size = 1 / 2
+        ) +
+        xlab(paste0("PC", j)) +
+        ylab(paste0("PC", i))
+    }
+
+    fig.04_pca_comparisons <- fig.04_pca_comparisons + p
+  }
+}
+fig.04_pca_comparisons
+```
+
+```{r save_fig_pca_comparisons, eval=F}
+ajtools::ggfigsave(fig.04_pca_comparisons, path = "figures", format = c("png", "pdf"), width = 13)
+```
+
+We can directly compare each PC calculated with FlashPCA with the PCs provided by the UK Biobank.
+
+```{r flashpca_vs_ukb, fig.asp=.8}
+fig.04_flashpca_vs_ukbpca <- patchwork:::plot_filler()
+
+for (pc in 1:10) {
+  p <- ggplot(df_merged_pca) +
+    geom_point(
+      aes(
+        x = !!as.symbol(paste0("PC", pc)),
+        y = (1 / 500) * !!as.symbol(paste0("f.22009.0.", pc, ".Genetic_principal_components"))
+      ),
+      alpha = 0.1
+    ) +
+    geom_abline(intercept = 0, slope = 1, color = "red")
+  fig.04_flashpca_vs_ukbpca <- fig.04_flashpca_vs_ukbpca + p
+}
+
+fig.04_flashpca_vs_ukbpca +
+  plot_annotation(
+    title = "FlashPCA/CMR versus UKB Principal Components"
+  )
+```
+
+```{r save_fig_flashpca_vs_ukb, eval=F}
+ajtools::ggfigsave(fig.04_flashpca_vs_ukbpca, path = "figures", format = c("png", "pdf"), width = 13)
+```

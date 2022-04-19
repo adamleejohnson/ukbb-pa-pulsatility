@@ -1,0 +1,552 @@
+# 8. Analyze GWAS Results
+
+Perform the initial processing and FUMA-based analysis of the GWAS results.
+
+```{r setup, include=FALSE}
+# Common setup
+source("setup.R")
+
+GWAS_RESULTS_DIR <- PROJ_ROOT %//% "analyses/gwas/results/853121_Pulsatility_flashPCA.minus_chf_phtn_copd_pe.with_BSA"
+
+GWAS_FILE_PREFIX <-
+  dir(path = GWAS_RESULTS_DIR, pattern = "\\.bgen\\.stats\\.xz$") %>%
+  gsub("(.*)\\.bgen\\.stats\\.xz$", "\\1", .)
+```
+
+## Export data for upload to FUMA and for storage
+
+Read the BOLT-LMM stats for genotypes SNPs and imputed SNPs. Note: I found a couple SNPs (e.g. rs141800131) that are in the directly genotyped data, but not the imputed data. This particular SNP (rs141800131) is also nowhere to be found in dbSNP. I assume this is a special variant used for the UKB assays, as it does not exist in the standard reference panels used for imputation. Therefore, we will only use SNPs found in the imputation data. However, if there is an imputed SNP that is also a genotyped SNP, we will use the p-value from the stats file for the genotyped SNPs.
+
+```{r, eval=F}
+geno_snps <- vroom(GWAS_RESULTS_DIR %//% GWAS_FILE_PREFIX %++% ".stats.xz", progress = T) %>% select(-F_MISS)
+imputed_snps <- vroom(GWAS_RESULTS_DIR %//% GWAS_FILE_PREFIX %++% ".bgen.stats.xz", progress = T) %>% select(-INFO)
+
+# IMPORTANT:
+# Bolt-LMM appears to use the reference allele as the effect allele. In other words, ALLELE1 in the Bolt-LMM stats file corresponds to the REF allele in the reference genome, and ALLELE1 is the "effect" allele. This is the *opposite* of what GTEx does, for example. GTEx uses the ALT allele as the effect allele. Because of this, we will adjust the Bolt-LMM results by swapping ALLELE1 and ALLELE0, taking the additive inverse of the A1FREQ, and negating the BETA coefficient.
+
+gwas_summary <-
+  bind_rows(
+    semi_join(geno_snps, imputed_snps, by = c("SNP", "CHR", "BP", "ALLELE1", "ALLELE0")), # all SNPS in geno_snps that are also in imputed_SNPs
+    anti_join(imputed_snps, geno_snps, by = c("SNP", "CHR", "BP", "ALLELE1", "ALLELE0")), # all imputed SNPs that are not in geno_snps
+  ) %>%
+  relocate("ALLELE0", .before = "ALLELE1") %>%
+  rename(
+    "ALLELE1_ALT" = "ALLELE0",
+    "ALLELE0_REF" = "ALLELE1"
+  ) %>%
+  mutate(
+    A1FREQ = 1 - A1FREQ,
+    BETA = -BETA
+  ) %>%
+  select(-CHISQ_LINREG, -P_LINREG, -CHISQ_BOLT_LMM_INF) %>%
+  arrange(CHR, BP) %>%
+  ajtools::write_parquet_zstd(GWAS_RESULTS_DIR %//% GWAS_FILE_PREFIX %++% "_combined.parquet", compression_level = 22) %>%
+  select(SNP, CHR, BP, P_BOLT_LMM_INF, ALLELE1_ALT, ALLELE0_REF) %>%
+  write_tsv(GWAS_RESULTS_DIR %//% GWAS_FILE_PREFIX %++% "_FUMA.tsv.gz")
+
+remove(geno_snps, imputed_snps)
+```
+
+GWAS was run with BOLT-LMM. Read the log file to extract information about samples and SNPs:
+
+```{r, cache=T}
+bolt_log <- read_file(dir(path = GWAS_RESULTS_DIR, pattern = "\\.log$", all.files = F, full.names = T))
+
+# general info
+calling_command <- str_extract(bolt_log, regex("(?<=Command line options:\\n\\n).*?(?=\\n\\n)", dotall = T))
+pheno_file <- str_match(bolt_log, "--phenoFile=.*/(data/bolt-lmm/.*) \\\\")[1, 2]
+covar_file <- str_match(bolt_log, "--covarFile=.*/(data/bolt-lmm/.*) \\\\")[1, 2]
+
+# number of individuals before/after QC
+qc_indiv_counts <- str_match_all(bolt_log, "Read data for (\\d+) indivs \\(ignored (\\d+) without genotypes\\) from:")[[1]]
+num_covariates <- qc_indiv_counts[1, 2] %>% as.integer()
+num_pheno <- qc_indiv_counts[2, 2] %>% as.integer()
+num_qc_covariates_no_geno <- qc_indiv_counts[1, 3] %>% as.integer()
+num_qc_pheno_no_geno <- qc_indiv_counts[2, 3] %>% as.integer()
+
+# number of individuals in input data (from another notebook)
+num_00_predicted <- nrow(arrow::read_parquet(PROJ_ROOT %//% "data/ukb_cmr_pulsatility_and_flashPCA.2021_11_19.zst.parquet"))
+
+# number of individuals excluded due to CHF/pHTN/COPD
+# -- pulsatility data is filtered by patients without these comorbidities
+num_01_excluded_comorbidities <- num_00_predicted - num_pheno
+
+# number of individuals excluded due to sex mismatch or high kinship
+# -- covariates are further filtered by patients with sex mismatch or high kinship
+num_02_excluded_sex_mismatch_kinship <- num_pheno - num_covariates
+
+# number of individuals excluded due to failed QC or missing genotypes
+num_03_excluded_qc_missing_geno <- num_qc_pheno_no_geno - (num_pheno - num_covariates)
+
+# number of individuals excluded due to missing covariates
+num_04_excluded_missing_covar <- str_match(bolt_log, "WARNING: (\\d+) of \\d+ samples passing previous QC have missing covariates")[1, 2] %>% as.integer()
+
+# number of individuals used in analysis
+num_05_final_gwas <- str_match(bolt_log, "Number of individuals used in analysis: Nused = (\\d+)")[1, 2] %>% as.integer()
+
+# sanity check
+stopifnot(num_05_final_gwas ==
+  num_00_predicted -
+    num_01_excluded_comorbidities -
+    num_02_excluded_sex_mismatch_kinship -
+    num_03_excluded_qc_missing_geno -
+    num_04_excluded_missing_covar)
+
+# count number of removed (genotyped) SNPs
+num_geno_snps <- str_match(bolt_log, "Total snps in PLINK data: Mbed = (\\d+)")[1, 2] %>% as.integer()
+num_post_qc_snps <- str_match(bolt_log, "Total post-QC SNPs: M = (\\d+)")[1, 2] %>% as.integer()
+```
+
+The calling command:
+
+```{r, results='asis'}
+cat(calling_command)
+```
+
+## Build GWAS flow diagram
+
+```{r, eval=F, cache=T}
+# get counts from other notebooks
+outliers <- ajtools::sourceRmd("notebooks/02_outlier_removal.Rmd")
+numPredicted <- outliers$numPredicted
+numOutliers <- outliers$numOutliers
+numPredicted_minusOutliers <- outliers$numPredicted_minusOutliers
+percent_outliers <- format(100 * numOutliers / numPredicted, digits = 2)
+remove(outliers)
+
+merged <- ajtools::sourceRmd("notebooks/03_merge_data.Rmd")
+numPredicted_minusOutliers_minusDuplicates <- merged$numPredicted_minusOutliers_minusDuplicates
+numPredicted_minusOutliers_minusDuplicates_mergedWithUKB <- merged$numPredicted_minusOutliers_minusDuplicates_mergedWithUKB
+num_duplicate_patients <- (numPredicted_minusOutliers - numPredicted_minusOutliers_minusDuplicates)
+num_removed_during_merge <- (numPredicted_minusOutliers_minusDuplicates - numPredicted_minusOutliers_minusDuplicates_mergedWithUKB)
+remove(merged)
+
+# get counts of specific comorbidities
+df_comorbid <-
+  arrow::read_parquet(PROJ_ROOT %//% "data/ukb_cmr_pulsatility_and_flashPCA.2021_11_19.zst.parquet") %>%
+  transmute(
+    dx_CHF = ukbiobank::diagnosed_chf(., up_to_instance = UKB_Instance),
+    dx_pHTN = ukbiobank::diagnosed_pHTN(., up_to_instance = UKB_Instance),
+    dx_COPD = ukbiobank::diagnosed_copd(., up_to_instance = UKB_Instance),
+    dx_PE = ukbiobank::diagnosed_pulm_embolism(., up_to_instance = UKB_Instance)
+  ) %>%
+  summarize(across(everything(), ~ sum(.x, na.rm = T))) %>%
+  transpose() %>%
+  mutate(across(everything(), ~ scibeautify(.x, justify_mode = "r"))) %>%
+  transpose()
+
+# apply some formatting
+num_excluded_step2 <- scibeautify(c(0, num_duplicate_patients, num_removed_during_merge), justify_mode = "r")
+num_excluded_step4 <- scibeautify(c(
+  0,
+  num_02_excluded_sex_mismatch_kinship,
+  num_03_excluded_qc_missing_geno + num_04_excluded_missing_covar
+), justify_mode = "r")
+
+
+# Create flow chart
+indent <- "\U200B" %++% paste0(rep("\U00A0", 7), collapse = "")
+ndf <- DiagrammeR::create_node_df(
+  n = 13,
+  label = c(
+    scibeautify(numPredicted) %++% "\n UK Biobank CMR studies  \n analyzed by neural network",
+    scibeautify(numPredicted_minusOutliers) %++% "\n PA pulsatility measurements passed QC",
+    scibeautify(numPredicted_minusOutliers_minusDuplicates_mergedWithUKB) %++% "\n Measurements from unique participants",
+    scibeautify(num_00_predicted - num_01_excluded_comorbidities) %++% "\n Without comorbid diseases",
+    scibeautify(num_05_final_gwas) %++% "\n Passed QC for GWAS",
+    "",
+    "",
+    "",
+    "",
+    scibeautify(numOutliers) %++% " studies discarded due to \\l" %++%
+      "failed segmentation QC \\l",
+    scibeautify(num_duplicate_patients + num_removed_during_merge) %++% " studies excluded due to unusable data \\l" %++%
+      indent %++% num_excluded_step2[3] %++% " phenotype data unavailable, and/or \\l" %++%
+      indent %++% sub("0", "\U2007", num_excluded_step2[1]) %++% " participant withdrawn \\l" %++%
+      indent %++% num_excluded_step2[2] %++% " duplicated participants \\l",
+    scibeautify(num_01_excluded_comorbidities) %++% " individuals excluded due to comorbid disease \\l diagnosed as of CMR study date \\l" %++%
+      indent %++% df_comorbid$dx_CHF %++% " congestive heart failure \\l" %++%
+      indent %++% df_comorbid$dx_COPD %++% " chronic obstructive pulmonary disease \\l" %++%
+      indent %++% df_comorbid$dx_PE %++% " pulmonary embolism \\l" %++%
+      indent %++% df_comorbid$dx_pHTN %++% " pulmonary hypertension \\l",
+    scibeautify(num_02_excluded_sex_mismatch_kinship +
+      num_03_excluded_qc_missing_geno +
+      num_04_excluded_missing_covar) %++% " excluded due to failed GWAS QC \\l" %++%
+      indent %++% num_excluded_step4[2] %++% " mismatch between genetic and reported sex, \\l" %++%
+      indent %++% sub("0", "\U2007", num_excluded_step4[1]) %++% " sex aneuploidy, or excessive kinship \\l" %++%
+      indent %++% num_excluded_step4[3] %++% " missing genotype or covariate data \\l"
+  ),
+  shape = "rectangle",
+  fontname = "Arial",
+  fixedsize = "false",
+  color = "black",
+  style = c(rep("", 9), rep("filled", 4)),
+  fontcolor = "black",
+  width = c(rep("", 5), rep(0, 4), rep("", 4)),
+  height = c(rep("", 5), rep(0, 4), rep("", 4)),
+  rank = c(2 * 1:5 - 1, 2 * 1:4, 2 * 1:4)
+)
+
+edf <- DiagrammeR::create_edge_df(
+  from = c(1:4, 6:9, 6:9),
+  to = c(6:9, 2:5, 10:13),
+  dir = c(rep("none", 4), rep("forward", 8)),
+  rel = "leading_to",
+  # tailport = c(rep("c", 8), rep("e", 4)),
+  color = "black"
+)
+
+gwas_flowchart <-
+  DiagrammeR::create_graph(
+    nodes_df = ndf,
+    edges_df = edf,
+    attr_theme = "tb"
+  ) %>%
+  DiagrammeR::add_global_graph_attrs(
+    "ratio", 1, "graph"
+  ) %>%
+  DiagrammeR::add_global_graph_attrs(
+    "ranksep", 0, "graph"
+  ) %>%
+  DiagrammeR::add_global_graph_attrs(
+    "layout", "dot", "graph"
+  )
+
+# gwas_flowchart %>% generate_dot() %>% cat()
+
+DiagrammeR::export_graph(gwas_flowchart, file_name = PROJ_ROOT %//% "figures/gwas_flow_diagram.pdf")
+DiagrammeR::export_graph(gwas_flowchart, file_name = PROJ_ROOT %//% "figures/gwas_flow_diagram.png", width = 5.5 * 600)
+write_rds(gwas_flowchart, PROJ_ROOT %//% "figures/gwas_flow_diagram.rds", compress = "xz", compression = 9)
+
+render_graph(gwas_flowchart)
+```
+
+## Load gwas summary results
+
+```{r}
+gwas_summary <- arrow::read_parquet(GWAS_RESULTS_DIR %//% GWAS_FILE_PREFIX %++% "_combined.zst.parquet")
+```
+
+## Manhattan plot
+
+Make a Manhattan plot of our GWAS results:
+
+```{r, eval=F}
+# highlight all loci at suggestive level
+gwas_summary %>%
+  ajtools::gg_manhattan(.,
+    chr = CHR,
+    pos = BP,
+    pval = P_BOLT_LMM_INF,
+    label = SNP,
+    label.mode = "signif",
+    hline.signif = 5e-8,
+    hline.suggest = 1e-6,
+    highlight_loci.thresh = 1e-6,
+    highlight_loci.width = 250,
+    point.size = 0.2,
+    # Only ~5% of points with p > 1e-3 are plotted, to prevent overplotting
+    overplot.limit = 1e-3,
+    overplot.frac = 0.05
+  ) %>%
+  ajtools::ggfigsave(.,
+    name = "gwas_pulsatility_manhattan_allLoci",
+    path = "figures",
+    format = c("pdf", "png"),
+    width = 6.5,
+    height = 2.5,
+    open = T
+  )
+
+# highlight all loci at genome-wide significant level
+gwas_summary %>%
+  ajtools::gg_manhattan(.,
+    chr = CHR,
+    pos = BP,
+    pval = P_BOLT_LMM_INF,
+    label = SNP,
+    label.mode = "none",
+    hline.signif = NA,
+    hline.suggest = NA,
+    limits_y = c(0, 10),
+    point.size = 0.2,
+    chr.colors = c("#3182BD", "gray75"),
+    highlight_loci.thresh = 5e-8,
+    highlight_loci.width = 250,
+    # Only ~5% of points with p > 1e-3 are plotted, to prevent overplotting
+    overplot.limit = 1e-5,
+    overplot.frac = 0.05
+  ) %>%
+  ajtools::ggfigsave(.,
+    name = "gwas_pulsatility_manhattan_genomeWide_v2",
+    path = "figures",
+    format = c("pdf"),
+    width = 6.5,
+    height = 2.5,
+    open = T
+  )
+```
+
+Make Q-Q plot with genomic inflation factor:
+
+```{r, eval=F}
+gwas_summary %>%
+  transmute(
+    log10p = -log10(P_BOLT_LMM_INF)
+  ) %>%
+  ggplot() +
+  aes(sample = log10p) +
+  stat_qq()
+
+chisq <- qchisq(1 - gwas_summary$P_BOLT_LMM_INF, 1)
+genomic_infl <- median(chisq) / qchisq(0.5, 1)
+```
+
+##FUMA analysis
+
+Data is uploaded to FUMA (http://fuma.ctglab.nl/) to perform identification of genomic risk loci and candidate SNPs, as well as additional gene-mapping analyses.
+
+Candidate SNPs are those that meet genome-wide cut-offs for suggestive significance (p < 1e-6). Gene mapping in FUMA consists of the following:
+
+1. Positional mapping
+2. eQTL-based mapping
+3. HiC-based mapping
+
+However, we will only be using the Positional mapping results from FUMA, and we will perform our own eQTL and epigenomic analyses.
+
+The result is a list of candidate SNPs, independent SNPs, risk loci, & candidate genes, which is designed to be overly inclusive at this stage.
+
+### Load FUMA results
+
+```{r}
+FUMA_ROOT <- PROJ_ROOT %//% "analyses/FUMA/FUMA_job159436_Pulsatility_noHR_suggestive_v2"
+indepdent_sig_snps <- vroom(FUMA_ROOT %//% "IndSigSNPs.txt", col_types = "iicciddii")
+lead_snps <- vroom(FUMA_ROOT %//% "leadSNPs.txt", col_types = "iicciddic")
+candidate_snps <- vroom(FUMA_ROOT %//% "snps.txt", col_types = "ccidccdddcicdcdiiiiii")
+risk_loci <- vroom(FUMA_ROOT %//% "GenomicRiskLoci.txt", col_types = "icciddddiiicic")
+candidate_genes_positional <- vroom(FUMA_ROOT %//% "genes.txt", col_types = "cciddicccddiddci")
+
+# some common flextable options to add to all the tables we'll generate below
+snp_table_common <- purrr::compose(
+  .dir = "forward",
+  ~ flextable::align(.x, j = -1, align = "center", part = "all"),
+  ~ flextable::align(.x, j = 1, align = "left", part = "all"),
+  ~ flextable::align(.x, j = "Signif\nLevel", align = "left", part = "body"),
+  ~ flextable::add_footer_lines(.x, NA),
+  ~ flextable::align(.x, align = "left", part = "footer"),
+  ~ flextable::compose(.x, part = "footer", value = as_paragraph(
+    "∗∗∗ = genome-wide significance, ", as_i("p"), " < 5 × 10", as_sup("−8"),
+    "\n",
+    "∗ = suggestive significance, ", as_i("p"), " < 1 × 10", as_sup("−6"),
+    "\n",
+    as_sup("† "), "base pair positions in GRCh37 coordinates.",
+    "\n",
+    "Minor allele frequencies are calculated within the UK Biobank population."
+  )),
+  ~ flextable::compose(.x, j = "Position", part = "header", value = as_paragraph(
+    "Position", as_sup("†")
+  )),
+  ~ flextable::line_spacing(.x, part = "footer", space = 1.5)
+)
+```
+
+Define a function to get minor allele frequency and other variant information from the `mfi` files provided by the UK Biobank (https://biobank.ndph.ox.ac.uk/ukb/refer.cgi?id=1967), which have been pre-processed and converted to parquet format for more efficient storage/retrieval:
+
+```{r}
+# location of the pre-processed ukb_imp_mfi files
+UKB_MFI_CHR_ROOT <- normalizePath(PROJ_ROOT %//% "../../Archives.nosync/ukb_imp_mfi")
+
+get_mfi_data <- function(snps) {
+  unique_chr <- unique(snps$chr)
+  mfi <- lapply(unique_chr, function(c) {
+    c <- ifelse(c == 23, "X", as.character(c))
+    mfi_file <- UKB_MFI_CHR_ROOT %//% "ukb_mfi_chr" %++% c %++% "_v3.zst.parquet"
+    message("Reading ", basename(mfi_file))
+    arrow::read_parquet(mfi_file, col_select = c("rsid", "MAF", "Minor_Allele")) %>% filter(rsid %in% snps$rsID)
+  })
+  mfi <- Reduce(bind_rows, mfi)
+  mfi[match(snps$rsID, mfi$rsid), ]
+}
+```
+
+Make some tables summarizing the basic FUMA results:
+
+#### Independent Significant SNPs
+
+```{r, eval=F}
+indepdent_sig_snps_mfi <- get_mfi_data(indepdent_sig_snps)
+
+indepdent_sig_snps %>%
+  left_join(candidate_snps) %>%
+  transmute(
+    "Variant ID" = rsID,
+    "Chr" = ifelse(chr == 23, "X", as.character(chr)),
+    "Position" = scibeautify(pos),
+    "Minor\nAllele" = indepdent_sig_snps_mfi$Minor_Allele,
+    "Minor Allele\nFrequency" = indepdent_sig_snps_mfi$MAF,
+    "Nearest\nGene" = str_split_fixed(nearestGene, ":", 2)[, 1],
+    "GWAS\np-value" = p,
+    "Signif\nLevel" = case_when(
+      p < 5e-8 ~ "∗∗∗",
+      p < 1e-6 ~ "∗",
+      T ~ ""
+    )
+  ) %>%
+  ajtools::flextable_scibeautify(.across = c("GWAS\np-value", "Minor Allele\nFrequency"), sci_mode = "auto") %>%
+  snp_table_common() %>%
+  ajtools::flextable_save("table_independent_SNPs_FUMA", path = PROJ_ROOT %//% "figures", overwrite = T)
+```
+
+#### Lead SNPs
+
+```{r, eval=F}
+lead_snps_mfi <- get_mfi_data(lead_snps)
+
+lead_snps %>%
+  left_join(candidate_snps) %>%
+  transmute(
+    "Variant ID" = rsID,
+    "Chr" = ifelse(chr == 23, "X", as.character(chr)),
+    "Position" = scibeautify(pos),
+    "Minor\nAllele" = lead_snps_mfi$Minor_Allele,
+    "Minor Allele\nFrequency" = lead_snps_mfi$MAF,
+    "Nearest\nGene" = str_split_fixed(nearestGene, ":", 2)[, 1],
+    "GWAS\np-value" = p,
+    "Signif\nLevel" = case_when(
+      p < 5e-8 ~ "∗∗∗",
+      p < 1e-6 ~ "∗",
+      T ~ ""
+    )
+  ) %>%
+  ajtools::flextable_scibeautify(.across = c("GWAS\np-value", "Minor Allele\nFrequency"), sci_mode = "auto") %>%
+  snp_table_common() %>%
+  ajtools::flextable_save("table_lead_SNPs_FUMA", path = PROJ_ROOT %//% "figures", overwrite = T)
+```
+
+#### Candidate SNPs
+
+```{r, eval=F}
+candidate_snps_mfi <- get_mfi_data(candidate_snps)
+
+candidate_snps %>%
+  transmute(
+    "Candidate\nVariant ID" = str_replace_all(rsID, "([ACTG]{2})[ACTG]{3,}([ACTG]{2})", "\\1...\\2"),
+    "Chr" = ifelse(chr == 23, "X", as.character(chr)),
+    "Position" = scibeautify(pos),
+    "Minor\nAllele" = str_replace_all(candidate_snps_mfi$Minor_Allele, "([ACTG]{2})[ACTG]{3,}([ACTG]{2})", "\\1...\\2"),
+    "Minor Allele\nFrequency" = candidate_snps_mfi$MAF,
+    "Nearest\nGene" = str_split_fixed(nearestGene, ":", 2)[, 1],
+    "Associated\nLead SNP" = IndSigSNP,
+    "r^2 with\nLead SNP" = scibeautify(r2, nsmall = 2, pad_zeros = T),
+    "GWAS\np-value" = gwasP,
+    "Signif\nLevel" = case_when(
+      gwasP < 5e-8 ~ "∗∗∗",
+      gwasP < 1e-6 ~ "∗",
+      T ~ ""
+    ),
+  ) %>%
+  ajtools::flextable_scibeautify(.across = c("GWAS\np-value", "Minor Allele\nFrequency"), sci_mode = "auto") %>%
+  flextable::compose(j = "r^2 with\nLead SNP", part = "header", value = as_paragraph(
+    "r", as_sup("2"), " with\nLead SNP"
+  )) %>%
+  flextable::bg(j = "r^2 with\nLead SNP", bg = function(x) {
+    rng <- range(candidate_snps$r2)
+    x <- (as.numeric(x) - rng[1]) / (rng[2] - rng[1])
+    ajtools::col_rmp_red(x)
+  }) %>%
+  snp_table_common() %>%
+  ajtools::flextable_save("table_candidate_SNPs_FUMA", path = PROJ_ROOT %//% "figures", overwrite = T)
+
+candidate_snps %>%
+  left_join(candidate_snps_mfi, by = c("rsID" = "rsid"), suffix = c(".fuma", ".mfi")) %>%
+  left_join(gwas_summary, by = c("chr" = "CHR", "pos" = "BP", "rsID" = "SNP")) %>%
+  distinct(chr, pos, rsID, .keep_all = T) %>%
+  mutate(
+    true_minor_allele = Minor_Allele, # determine the minor allele from the ukbiobank .mfi file (in the candidate_snps_mfi table)
+    true_maf = MAF.mfi, # determine the MAF from the ukbiobank .mfi file
+    infer_minor_allele = if_else(A1FREQ >= 0.5, ALLELE0_REF, ALLELE1_ALT), # sanity check to make sure the alleles in the summary stats match the alleles in the mfi file
+    allele_check = (true_minor_allele == infer_minor_allele),
+    infer_maf = if_else(A1FREQ >= 0.5, 1 - A1FREQ, A1FREQ),
+    maf_check = -log10(abs(true_maf - infer_maf)),
+    infer_minor_allele_BETA = if_else(A1FREQ >= 0.5, -BETA, BETA),
+  ) %>%
+  transmute(
+    "Candidate\nVariant ID" = str_replace_all(rsID, "([ACTG]{2})[ACTG]{3,}([ACTG]{2})", "\\1...\\2"),
+    "Chr" = ifelse(chr == 23, "X", as.character(chr)),
+    "Position" = scibeautify(pos),
+    "Minor\nAllele" = str_replace_all(true_minor_allele, "([ACTG]{2})[ACTG]{3,}([ACTG]{2})", "\\1...\\2"),
+    "Minor Allele\nFrequency" = true_maf,
+    "Nearest\nGene" = str_split_fixed(nearestGene, ":", 2)[, 1],
+    "Effect\nDirection" = infer_minor_allele_BETA,
+    "GWAS\np-value" = gwasP,
+    "Signif\nLevel" = case_when(
+      gwasP < 5e-8 ~ "∗∗∗",
+      gwasP < 1e-6 ~ "∗",
+      T ~ ""
+    ),
+  ) %>%
+  filter(`Signif\nLevel` != "") %>%
+  ajtools::flextable_scibeautify(.across = c("GWAS\np-value", "Minor Allele\nFrequency"), sci_mode = "auto") %>%
+  flextable::compose(j = "Effect\nDirection", use_dot = T, value = as_paragraph(
+    ifelse(. < 0, "–", "+")
+  )) %>%
+  snp_table_common() %>%
+  flextable::line_spacing(part = "all", space = 1) %>%
+  flextable::bg(i = ~ seq_len(nrow(data)) %% 2 == 1, bg = "grey97") %>%
+  ajtools::flextable_save("table_sig_candidate_SNPs_FUMA_v2", path = PROJ_ROOT %//% "figures", overwrite = T)
+```
+
+#### Position-mapped genes
+
+```{r, eval=F}
+candidate_genes_positional %>%
+  transmute(
+    "Gene Symbol" = if_else(is.na(HUGO), symbol, HUGO),
+    "Chr" = ifelse(chr == 23, "X", as.character(chr)),
+    "Position" = start,
+    "Type" = recode(type,
+      "misc_RNA" = "Misc RNA",
+      "protein_coding" = "Protein-coding",
+      "pseudogene" = "Pseudo-gene",
+      "processed_transcript" = "Processed transcript",
+      "antisense" = "Anti-sense",
+    ),
+    "Associated Indepdent SNP(s)" = str_replace_all(IndSigSNPs, ";", ", "),
+    "Minimum GWAS\nP-value" = minGwasP,
+    "Signif\nLevel" = case_when(
+      minGwasP < 5e-8 ~ "∗∗∗",
+      minGwasP < 1e-6 ~ "∗",
+      T ~ ""
+    ),
+  ) %>%
+  flextable_scibeautify(.across = c("Minimum GWAS\nP-value")) %>%
+  snp_table_common() %>%
+  flextable::bg(i = ~ seq_len(nrow(data)) %% 2 == 1, bg = "grey97") %>%
+  flextable::compose(part = "footer", value = as_paragraph(
+    "∗∗∗ = genome-wide significance, ", as_i("p"), " < 5 × 10", as_sup("−8"),
+    "\n",
+    "∗ = suggestive significance, ", as_i("p"), " < 1 × 10", as_sup("−6"),
+    "\n",
+    "Chr = chromosome; snRNA = small nuclear RNA; snoRNA = small nucleolar RNA; lincRNA = long intergenic non-coding RNA; rRNA = ribosomal RNA"
+  )) %>%
+  ajtools::flextable_save("table_candidate_genes_FUMA", path = PROJ_ROOT %//% "figures", overwrite = T)
+```
+
+#### Risk loci
+
+```{r, eval=F}
+risk_loci %>%
+  transmute(
+    # "Risk Locus" = GenomicLocus,
+    "Chromosome" = ifelse(chr == 23, "X", as.character(chr)),
+    "Range" = scibeautify(start) %++% " – ⁠" %++% scibeautify(end),
+    "Lead Variant" = rsID,
+    "Minimum GWAS\nP-value" = p
+  ) %>%
+  flextable_scibeautify(.across = c("Minimum GWAS\nP-value")) %>%
+  flextable::bg(i = ~ seq_len(nrow(data)) %% 2 == 1, bg = "grey97") %>%
+  ajtools::flextable_save("table_risk_loci_FUMA", path = PROJ_ROOT %//% "figures", overwrite = T)
+```
+
+
+

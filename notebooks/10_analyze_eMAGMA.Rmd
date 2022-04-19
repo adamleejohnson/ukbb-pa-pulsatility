@@ -1,0 +1,278 @@
+# 10. eMAGMA
+
+eMAGMA, eQTL-based gene aggregation analysis.
+
+Refer to:
+
+  - Gerring, Z. F., Gamazon, E. R., Derks, E. M. & Major Depressive Disorder Working Group of the Psychiatric Genomics, C. A gene co-expression network-based analysis of multiple brain tissues reveals novel genes and molecular pathways underlying major depression. PLoS Genet 15, e1008245, doi:10.1371/journal.pgen.1008245 (2019).
+
+  - de Leeuw, C. A., Mooij, J. M., Heskes, T. & Posthuma, D. MAGMA: generalized gene-set analysis of GWAS data. PLoS Comput Biol 11, e1004219, doi:10.1371/journal.pcbi.1004219 (2015).
+
+  - de Leeuw, C. A., Neale, B. M., Heskes, T. & Posthuma, D. The statistical properties of gene-set analysis. Nat Rev Genet 17, 353-364, doi:10.1038/nrg.2016.29 (2016).
+    
+  - de Leeuw, C. A., Stringer, S., Dekkers, I. A., Heskes, T. & Posthuma, D. Conditional and interaction gene-set analysis reveals novel functional pathways for blood pressure. Nat Commun 9, 3768, doi:10.1038/s41467-018-06022-6 (2018).
+
+
+Also refer to the tutorial for eMAGMA on github: https://github.com/eskederks/eMAGMA-tutorial.
+
+```{r setup}
+# Common setup
+source("setup.R")
+
+gwas_analysis <- ajtools::sourceRmd(PROJ_ROOT %//% "notebooks/08_analyze_gwas_results.Rmd")
+GWAS_RESULTS_DIR <- gwas_analysis$GWAS_RESULTS_DIR
+GWAS_FILE_PREFIX <- gwas_analysis$GWAS_FILE_PREFIX
+```
+
+## 1. Make a new directory, download the software and unzip it.
+
+```{bash, eval=F}
+mkdir -p analyses/eMAGMA/magma_src
+cd analyses/eMAGMA/magma_src
+wget https://ctg.cncr.nl/software/MAGMA/prog/magma_v1.09b_mac.zip
+wget https://ctg.cncr.nl/software/MAGMA/prog/magma_v1.09b_static.zip
+unzip magma_v1.09b_mac.zip -d magma_v1.09b_mac
+chmod +x magma_v1.09b_mac/magma
+unzip magma_v1.09b_static.zip -d magma_v1.09b_static
+chmod +x magma_v1.09b_static/magma
+
+cd ../
+ln -s magma_src/magma_v1.09b_mac/magma
+```
+
+## 2. Get auxillary files and reference data
+
+```{bash, eval=F}
+wget https://ctg.cncr.nl/software/MAGMA/aux_files/NCBI37.3.zip
+wget https://ctg.cncr.nl/software/MAGMA/aux_files/NCBI38.zip
+wget https://ctg.cncr.nl/software/MAGMA/aux_files/dbsnp151.synonyms.zip
+wget https://ctg.cncr.nl/software/MAGMA/ref_data/g1000_eur.zip
+```
+
+## 3. Load GWAS summary data and export to MAGMA-readable format
+
+```{r, eval=F}
+gwas_analysis$gwas_summary %>%
+  select(SNP, CHR, BP, P = P_BOLT_LMM_INF) %>%
+  write_tsv(PROJ_ROOT %//% "analyses/eMAGMA/pulsatility_gwas.txt")
+```
+
+## 4. Perform annotation (pre-processing step) from GTEx data for selected tissue type
+
+```{r}
+tissues <- c(
+  "Artery_Coronary",
+  "Artery_Aorta",
+  "Artery_Tibial",
+  "Cells_Cultured_fibroblasts",
+  "Heart_Atrial_Appendage",
+  "Heart_Left_Ventricle",
+  "Lung"
+)
+```
+
+```{r, eval=F}
+for (tissue_type in tissues) {
+  # read GTEx data
+  gtex_filename <-
+    PROJ_ROOT %//%
+    "../../Archives.nosync/GTEx/GTEx_Analysis_v8_eQTL_signif_associations/GTEx_Analysis_v8_eQTL_annotated" %//%
+    tissue_type %++% ".v8.signif_variant_gene_pairs_annotated.zst.parquet"
+
+  message("Processing ", gtex_filename)
+  gtex_data_raw <- arrow::read_parquet(gtex_filename) %>% as_tibble()
+
+  # filter out rows with missing values
+  gtex_data <-
+    gtex_data_raw %>%
+    filter(!is.na(gene_start_b37)) %>%
+    filter(!is.na(gene_chr_b37)) %>%
+    mutate(rsid = if_else(rsid == ".", paste0(str_remove(variant_chr_b37, "^chr"), ":", variant_pos_b37), rsid))
+
+  # format into annot form for magma, e.g.
+  # ENSG00000237940.3 1:879583:894679 rs562832445    rs76388980    rs116498217    rs61766325    rs111819742    rs13303066
+  gtex_data %>%
+    transmute(
+      ensembl_gene_id = xfun::sans_ext(ensembl_gene_id),
+      chr = str_remove(gene_chr_b37, "^chr"),
+      start = gene_start_b37,
+      stop = gene_end_b37,
+      rsid
+    ) %>%
+    group_by(chr, start, stop, ensembl_gene_id) %>%
+    summarize(snp_string = paste0(rsid, collapse = "    "), .groups = "keep") %>%
+    ungroup() %>%
+    transmute(annot = paste0(ensembl_gene_id, " ", chr, ":", start, ":", stop, " ", snp_string)) %>%
+    pull() %>%
+    write_lines(PROJ_ROOT %//% "analyses/eMAGMA/emagma_gtex_annot/" %++% tissue_type %++% ".genes.annot")
+}
+```
+
+## 5. Run magma
+
+This is the core command contained in `batch_magma.sh`
+
+```{bash, eval=F}
+./magma \
+	--bfile g1000_eur/g1000_eur \
+	--gene-annot emagma_gtex_annot/{1}.genes.annot \
+	--pval pulsatility_gwas.txt N=${Nsamples} \
+	--gene-model snp-wise=multi \
+	--genes-only \
+	--out results/{1}/{1}_eMAGMA_multi
+```
+
+## 6. Analyze results
+
+```{r, fig.height=3, eval=F}
+eMAGMA_results <- tibble()
+
+for (tissue_type in tissues) {
+  for (i in 1:3) {
+    pval_col <- as.symbol(c("P_MULTI", "P_SNPWISE_TOP1", "P_SNPWISE_MEAN")[i])
+    pval_mode <- c("multi", "top", "mean")[i]
+
+    # read gene names data
+    egenes <-
+      arrow::read_parquet(
+        PROJ_ROOT %//%
+          "../../Archives.nosync/GTEx/GTEx_Analysis_v8_eQTL_signif_associations/GTEx_Analysis_v8_eQTL_annotated" %//%
+          tissue_type %++% ".v8.signif_variant_gene_pairs_annotated.zst.parquet"
+      ) %>%
+      distinct(ensembl_gene_id, .keep_all = T) %>%
+      select(ensembl_gene_id, gene_name, gene_chr_b37, gene_start_b37, gene_end_b37) %>%
+      mutate(across(c(ensembl_gene_id, gene_name, gene_chr_b37), as.character)) %>%
+      mutate(ensembl_gene_id = xfun::sans_ext(ensembl_gene_id))
+
+    # read raw data
+    emagma_raw <-
+      read_table(PROJ_ROOT %//% "analyses/eMAGMA/results/" %//% tissue_type %//% tissue_type %++% "_eMAGMA_multi.genes.out",
+        col_types = "cciiiiidddd"
+      ) %>%
+      left_join(egenes, by = c("GENE" = "ensembl_gene_id"))
+
+    # filter by adjusted p value
+    emagma_filtered <-
+      emagma_raw %>%
+      mutate(pval_adj = p.adjust(!!pval_col, method = "BH")) %>%
+      filter(pval_adj < 0.05) %>%
+      transmute(
+        ensembl_gene_id = as.character(GENE),
+        gene_name,
+        chr = as.character(gene_chr_b37),
+        start = as.integer(gene_start_b37),
+        stop = as.integer(gene_end_b37),
+        numVariants = as.integer(NSNPS),
+        pval_nominal = as.double(!!pval_col),
+        pval_fdr_adjusted = as.double(pval_adj),
+        tissue = tissue_type,
+        pval_magma_mode = pval_mode,
+      )
+
+    # save results
+    eMAGMA_results %<>% bind_rows(emagma_filtered)
+
+    # create manhattan plots
+    emagma_raw %>%
+      ajtools::gg_manhattan(.,
+        title = "eMAGMA: " %++% str_replace_all(tissue_type, "_", " "),
+        pval = pval_col,
+        chr = gene_chr_b37,
+        pos = gene_start_b37,
+        label = gene_name,
+        label.mode = "fdr05",
+        hline.signif = NA,
+        label.size = 0.6,
+        point.size = 0.3,
+        chr.colors = ajtools::manhattan_colors_Crimson()
+      ) %>%
+      ajtools::ggfigsave(
+        path = "figures/eMAGMA",
+        name = "eMAGMA_" %++% pval_mode %++% "_" %++% tissue_type,
+        width = 6.5,
+        height = 3,
+        overwrite = T
+      )
+  }
+}
+
+eMAGMA_results %>%
+  arrange(pval_magma_mode, chr, start, tissue) %>%
+  write_tsv(ajtools::file_datestamp("significant_genes_summary.txt", path = PROJ_ROOT %//% "analyses/eMAGMA/"))
+```
+
+## 7. Create a table
+
+```{r}
+eMAGMA_results <- read_tsv(PROJ_ROOT %//% "analyses/eMAGMA/significant_genes_summary.2021_12_22.txt", col_types = "ccciiiddcc")
+```
+
+
+```{r, eval=F}
+eMAGMA_results %>%
+  filter(pval_magma_mode == "multi") %>%
+  select(-numVariants, -pval_magma_mode, -pval_nominal) %>%
+  mutate(chr = ordered(chr, levels = paste0("chr", c(1:23, "X")), labels = c(1:23, "X"))) %>%
+  arrange(pval_fdr_adjusted, chr, start) %>%
+  group_by(gene_name, ensembl_gene_id, chr, start, stop) %>%
+  mutate(min_qval = min(pval_fdr_adjusted)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = tissue, values_from = pval_fdr_adjusted) %>%
+  transmute(
+    "Gene Name" = gene_name,
+    "Ensembl ID" = ensembl_gene_id,
+    "Chr" = chr,
+    "Position" = paste0(scibeautify(start), " – ", scibeautify(stop)),
+    "Minimum\nq-value" = min_qval,
+    "Aorta" = Artery_Aorta,
+    "Coronary\nArtery" = Artery_Coronary,
+    "Tibial\nArtery" = Artery_Tibial,
+    "Atrial\nAppendage" = Heart_Atrial_Appendage,
+    "Left\nVentricle" = Heart_Left_Ventricle,
+    "Lung" = Lung,
+    "Cultured\nFibroblasts" = Cells_Cultured_fibroblasts,
+  ) %>%
+  ajtools::flextable_scibeautify(.across = c("Minimum\nq-value"), sci_mode = "auto") %>%
+  flextable::align(j = -1, part = "all", align = "center") %>%
+  # alternating row colors
+  flextable::bg(i = ~ seq_len(nrow(data)) %% 2 == 1, bg = "grey97") %>%
+  # Label over tissues
+  flextable::add_header_row(colwidths = c(1, 1, 1, 1, 1, 7), values = c("Gene Name", "Ensembl ID", "Chr", "Position", "Minimum\nq-value", "Tissue")) %>%
+  flextable::merge_v(j = 1:5, part = "header") %>%
+  flextable::hline(i = 1, j = -c(1:5), part = "header", border = officer::fp_border(width = 1)) %>%
+  # Vertical line between tissues and rest of table
+  flextable::vline(j = 5) %>%
+  # Checkmark and coloring of FDR values
+  flextable::compose(j = -c(1:5), use_dot = T, value = as_paragraph(
+    ifelse(!is.na(.), "✓", NA)
+  )) %>%
+  flextable::bg(j = -c(1:5), bg = function(x) {
+    rng <- range(-log10(eMAGMA_results$pval_fdr_adjusted))
+    x <- (-log10(x) - rng[1]) / (rng[2] - rng[1])
+    ajtools::col_rmp_red(x)
+  }) %>%
+  # Footer and footnotes
+  flextable::add_footer_lines(NA) %>%
+  flextable::align(align = "left", part = "footer") %>%
+  flextable::compose(j = "Position", part = "header", value = as_paragraph(
+    "Position", as_sup("†")
+  )) %>%
+  flextable::compose(j = "Minimum\nq-value", part = "header", value = as_paragraph(
+    "Minimum\n", as_i("q"), "-value", as_sup("‡")
+  )) %>%
+  flextable::compose(i = 1, j = -c(1:5), part = "header", value = as_paragraph(
+    "Tissue ", as_i("q"), " < 0.05", as_sup("§")
+  )) %>%
+  flextable::compose(part = "footer", value = as_paragraph(
+    as_sup("† "), "base pair positions in GRCh37 coordinates.",
+    "\n",
+    as_sup("‡ "), "minimum ", as_i("q"), "-value across all tissue types, where ", as_i("q"), " is the ", as_i("p"), "-value adjusted for a FDR < 0.05.",
+    "\n",
+    as_sup("§ "), "for each tissue type, a check indicates whether the  ", as_i("q"), "-value for the specified gene is significant (", as_i("q"), " < 0.05).",
+    "\n",
+    "Genes for which ", as_i("q"), " did not reach significance across any tissue type are omitted."
+  )) %>%
+  flextable::line_spacing(part = "footer", space = 1.5) %>%
+  ajtools::flextable_save("table_eMAGMA_genes", path = PROJ_ROOT %//% "figures", overwrite = T)
+```
+

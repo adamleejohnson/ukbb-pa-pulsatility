@@ -1,0 +1,516 @@
+# 13. Analyze gene expression data
+
+Analyze single-cell RNA sequencing data sets and RNA microarray data.
+
+```{r setup}
+# Common setup
+source("setup.R")
+
+# Package for reading ontology data
+# BiocManager::install("rols")
+loadNamespace("rols")
+
+# Package for reading hdA5 files
+loadNamespace("anndata")
+```
+
+Load data from secondary analyses:
+
+```{r}
+genes_ALL_scored <- ajtools::sourceRmd(PROJ_ROOT %//% "notebooks/12_analyze_all_secondary.Rmd")$genes_ALL_scored %>% filter(score >= 2)
+```
+
+## Qualitative relative gene expression: Tabula Sapiens
+
+**Consortium TTS, Quake SR. The Tabula Sapiens: a multiple organ single cell transcriptomic atlas of humans. bioRxiv (Preprint). 2021:2021.2007.2019.452956. doi: 10.1101/2021.07.19.452956**
+
+
+The following metadata categories are available:
+
+  - donor: Set of donors available in the dataset. For details see the donor characteristics summary.
+  - organ_tissue: List of organs available in Tabula Sapiens.
+  - anatomical_information: If available, more specific information of where in the organ the cells were collected is provided.
+  - gender: Gender of donors available in the dataset. For details see the donor characteristics summary.
+  - cell_ontology_class: Cell type annotations using the Cell Ontology.
+  - free_annotation: Cell type annotations using free text.
+  - compartment: Functional compartment for each cell type.
+  - manually_annotated: True or False, whether or not the corresponding value in Annotation has been manually verified by a tissue expert.
+  - method: smartseq2 (full-length) or 10x (3prime).
+  - n_counts_UMIs: number of counts (smartseq2) or UMIs (10x) per cell.
+  - n_genes: number of genes per cell.
+  
+The following numeric layers are available:
+
+  - .layers["raw_counts"]: raw, not normalized counts.
+  - .layers["decontXcounts"]: decontX corrected counts.
+  - .raw.X: log1p normalized decontX corrected counts.
+  - .X: log1p normalized and scaled decontX corrected counts.
+
+Load the Tabula Sapiens Data:
+
+```{r, eval=F}
+ts_file <- PROJ_ROOT %//% "../../Archives.nosync/singlecell/Tabula Sapiens/TS_cellxgene_AllCells.h5ad"
+ts_h5ad <- anndata::read_h5ad(ts_file, "r")
+```
+
+Inspect the layers, and how many observations (cells) and variables (genes) there are:
+
+```{r, eval=F}
+cat("#cells:", ts_h5ad$n_obs, "\n")
+cat("#genes:", ts_h5ad$n_vars, "\n")
+cat("layers:", paste(ts_h5ad$layers$keys(), collapse = ", "), "\n")
+cat("obs_keys:", paste("  ", seq_along(ts_h5ad$obs_keys()), ts_h5ad$obs_keys()), sep = "\n")
+cat("var_keys:", paste("  ", seq_along(ts_h5ad$var_keys()), ts_h5ad$var_keys()), sep = "\n")
+```
+
+Build list of identifiers from the EMBL-EBI Ontology Lookup Service
+
+See for example, https://www.ebi.ac.uk/ols/search?q=fibroblast&ontology=cl
+
+```{r, eval=F}
+# get the parent cell category for each of our cell types of interest
+# -- use https://www.ebi.ac.uk/ols to browse and search cell types under the "CL" ontology
+lookup_cl_ontology_label <- function(label) {
+  stopifnot(require(rols))
+  search <- rols::OlsSearch(q = label, ontology = "cl", queryFields = "label", exact = T)
+  search_res <- rols::olsSearch(search)
+  search_res <- as(search_res, "Terms")
+  search_res[[1]]
+}
+
+# create a list of all possible descendants by recursing over children
+get_ontology_children <- function(parent_cell = NULL, label = NULL) {
+  parent_cell <- parent_cell %||% lookup_cl_ontology_label(label)
+  stopifnot(inherits(parent_cell, "Term"))
+  df <- rols::as.Term.data.frame(parent_cell)
+  if (slot(parent_cell, "has_children")) {
+    children <- rols::children(parent_cell)
+    for (i in seq_along(children)) df <- rbind(df, get_ontology_children(parent_cell = children[[i]]))
+  }
+  return(df)
+}
+
+cell_ontologies <- list(
+  all = NULL,
+  fibroblast = get_ontology_children(label = "fibroblast")$id,
+  pericyte = get_ontology_children(label = "pericyte cell")$id,
+  endothelium = get_ontology_children(label = "endothelial cell")$id,
+  smc = get_ontology_children(label = "smooth muscle cell")$id,
+  vascular_smc = get_ontology_children(label = "vascular associated smooth muscle cell")$id,
+  adventitium_smc = get_ontology_children(label = "adventitial cell")$id
+)
+```
+
+Populate indices of cells by tissue and cell type, and populate gene indices:
+
+```{r, eval=F}
+# get ensembl ids of genes in the data set, removing the trailing version number
+ensembl_ids <- ts_h5ad$var_names
+
+# get the indices of our genes of interest & canonical genes
+genes_canonical <- c(
+  fibroblast = "ENSG00000196154", # FSP1
+  pericyte = "ENSG00000173546", # NG2
+  endothelium = "ENSG00000179776", # VE-Cadherin
+  smc = "ENSG00000107796" # ACTA2
+)
+genes_interest <- genes_ALL_scored %>% select(gene, ensembl_id) %>% deframe() %>% .[. %in% ensembl_ids]
+
+# generate lists of indices of various cell populations
+obs_indices <- sapply(c("all", levels(ts_h5ad$obs$tissue)), function(tissue) {
+  sapply(names(cell_ontologies), function(cell) {
+    if (tissue == "all") {
+      if (cell == "all")
+        seq_along(ts_h5ad$obs_names)
+      else
+        which(ts_h5ad$obs$cell_type_ontology_term_id %in% cell_ontologies[[cell]])
+    } else {
+      if (cell == "all")
+        which(ts_h5ad$obs$tissue == tissue)
+      else
+        which(ts_h5ad$obs$tissue == tissue & ts_h5ad$obs$cell_type_ontology_term_id %in% cell_ontologies[[cell]])
+    }
+  }, simplify = F)
+}, simplify = F)
+
+# generate lists of male & female indices
+obs_male_indices <- which(ts_h5ad$obs$sex == "male")
+obs_female_indices <- which(ts_h5ad$obs$sex == "female")
+```
+
+Specify the tissue we're going to look at:
+
+```{r}
+tissue <- "vasculature"
+```
+
+For each cell type, generate percentiles for the NON-ZERO MEAN relative expression of all genes
+
+  - for each gene, the ratio of gene read counts to read counts of the canonical gene is averaged, excluding any cells that do not express the canonical gene
+  - excluding any mean ratios that are zero, percentiles are then generated
+
+```{r, eval=F}
+percentiles_by_cell_type <- sapply(names(genes_canonical), function(cell_type) {
+  
+  # create cell-type specific subset of counts matrix
+  counts_matrix <- ts_h5ad[obs_indices[[tissue]][[cell_type]], ]$layers$decontXcounts
+  colnames(counts_matrix) <- ts_h5ad$var_names
+  
+  # get values of canonical gene counts
+  canonical_gene_id <- genes_canonical[cell_type]
+  canonical_gene_counts <- counts_matrix[, canonical_gene_id]
+  
+  # normalize counts matrix by canonical gene counts, selecting only cells that have non-zero canonical gene counts
+  non_zero <- which(canonical_gene_counts > 0)
+  counts_matrix_norm <- counts_matrix[non_zero, ] / canonical_gene_counts[non_zero]
+  
+  # get column-wise (gene-wise) means
+  means <- Matrix::colMeans(counts_matrix_norm)
+  
+  # ignore zero values (this isn't strictly necessary, but if we don't do this then 0 -> 40th or 50th percentile)
+  means <- means[means > 0]
+  
+  # create percentiles
+  quantile(means, probs = 0:1000 / 1000)
+})
+```
+
+Now calculate the mean ratio of gene-of-interest counts to canonical gene counts for each gene and each cell type
+
+  - again, exclude any cells for which the canonical gene count is zero
+
+```{r, eval=F}
+genes_expression_rel_canonical <-
+  sapply(names(genes_canonical), function(cell_type) {
+    
+    # indices of cells that match this cell type
+    cell_type_idx <- obs_indices[[tissue]][[cell_type]]
+    
+    # filter by males or female
+    # cell_type_idx <- intersect(cell_type_idx, obs_male_indices)
+    # cell_type_idx <- intersect(cell_type_idx, obs_female_indices)
+    
+    # create cell-type specific subset of counts matrix
+    counts_matrix <- ts_h5ad[cell_type_idx, genes_interest]$layers$decontXcounts
+    
+    # get values of canonical gene counts
+    canonical_gene_id <- genes_canonical[cell_type]
+    canonical_gene_counts <- ts_h5ad[cell_type_idx, canonical_gene_id]$layers$decontXcounts
+    
+    # normalize counts matrix by canonical gene counts, removing cells that are non-expressers
+    non_zero <- which(as.numeric(canonical_gene_counts) > 0)
+    counts_matrix_norm <- counts_matrix[non_zero, ] / canonical_gene_counts[non_zero]
+    
+    # return the raw expression values in list form
+    gene_expression_raw <- split(counts_matrix_norm, col(counts_matrix_norm))
+    gene_expression_raw <- setNames(gene_expression_raw, names(genes_interest))
+    return(gene_expression_raw)
+  }, simplify = F)
+
+# calculate mean of each of the raw expression vectors for each cell_type & gene
+genes_mean_expression <- genes_expression_rel_canonical %>% sapply(., function(x) sapply(x, mean))
+genes_nonzero <- genes_expression_rel_canonical %>% sapply(., function(x) sapply(x, function(y) sum(y > 0)))
+genes_N <- genes_expression_rel_canonical %>% sapply(., function(x) sapply(x, length))
+print(genes_mean_expression)
+```
+
+Convert these ratios to percentiles using the percentiles table we calculated above
+
+```{r, eval=F}
+convert_mean_ratio_to_percentile <- function(mean_ratios, percentiles = percentiles_by_cell_type) {
+  sapply(names(genes_canonical), function(cell_type) {
+    
+    ratios <- mean_ratios[, cell_type]
+    percentiles <- percentiles[, cell_type]
+    
+    # convert to percentiles
+    # -- this function retrieves indices into the `percentiles` vector
+    ratio_as_percentile <- findInterval(ratios, percentiles)
+    
+    # force 0 values to NA, and convert non-zero values to percentiles
+    ratio_as_percentile[ratios == 0] <- NA
+    ratio_as_percentile[ratios > 0] <- names(percentiles)[ratio_as_percentile[ratios > 0]]
+    ratio_as_percentile <- readr::parse_number(ratio_as_percentile)
+
+    ratio_as_percentile <- setNames(ratio_as_percentile, names(ratios))
+    return(ratio_as_percentile)
+  })
+}
+
+genes_percentile_expression <- convert_mean_ratio_to_percentile(genes_mean_expression)
+print(genes_percentile_expression)
+```
+
+Save to disk:
+
+```{r, eval=F}
+genes_percentile_expression %>%
+  as.data.frame() %>%
+  rename_with(~ paste0("percentile_", .x)) %>%
+  rownames_to_column("gene") %>%
+  left_join(
+    genes_mean_expression %>%
+      as.data.frame() %>%
+      rename_with(~ paste0("mean_expr_", .x)) %>%
+      rownames_to_column("gene"),
+    by = "gene"
+  ) %>%
+  left_join(genes_ALL_scored, by = "gene") %>%
+  select(-starts_with("hit_")) %>%
+  relocate(starts_with("percentile_"), starts_with("mean_expr_"), .after = last_col()) %>%
+  write_csv(ajtools::file_datestamp("vasculature_cell_type_expression.txt.gz", path = PROJ_ROOT %//% "analyses/single_cell/"))
+```
+
+Read from disk and format as table:
+
+```{r}
+genes_expression_by_cell_type <- read_csv(PROJ_ROOT %//% "analyses/single_cell/vasculature_cell_type_expression.2022_01_18.txt.gz", show_col_types = F)
+```
+
+```{r, eval=F}
+genes_expression_by_cell_type %>%
+  filter(!endsWith(gene_biotype, "_pseudogene")) %>%
+  mutate(description = ifelse(description == "TEC", "To be experimentally confirmed", description)) %>%
+  transmute(
+    "Gene Symbol" = gene,
+    "Ensembl ID" = ensembl_id,
+    "Gene Type" = gene_biotype,
+    "Description" = description,
+    "Chromosome" = chr,
+    "Start Position" = scibeautify(start_position),
+    "Fibroblast" = percentile_fibroblast,
+    "Pericyte" = percentile_pericyte,
+    "Endothelium" = percentile_endothelium,
+    "VSMC" = percentile_smc
+  ) %>% {
+    expr_cols <- which(names(.) %in% c("Fibroblast", "Pericyte", "Endothelium", "VSMC"))
+    nt <- length(expr_cols)
+    nc <- ncol(.) - nt
+    
+    flextable::flextable(.) %>%
+    flextable::align(j = -1, part = "all", align = "center") %>%
+    #left-align descriptions
+    flextable::align(j = "Description", part = "body", align = "left") %>%
+    #display +++'s for percentiles
+    flextable::compose(j = expr_cols, use_dot = T, value = as_paragraph(
+      case_when(
+        is.na(.) ~ '⁠–',
+        . <= 1 ~ '⁠–',
+        . > 1 & . <= 25 ~ "+",
+        . > 25 & . <= 75 ~ "++",
+        . > 75 ~ "+++"
+      )
+    )) %>%
+    flextable::vline(j = min(expr_cols) - 1) %>%
+    #merge header over cell type
+    flextable::add_header_row(colwidths = c(rep(1,nc),nt), values = c(.$header$col_keys[1:nc], "")) %>%
+    flextable::compose(i = 1, j = -c(1:nc), part = "header", value = as_paragraph(
+      "Relative Expression in Vasculature", as_sup("‡")
+    )) %>%
+    flextable::merge_v(j = 1:nc, part = "header") %>%
+    flextable::hline(i = 1, j = -c(1:nc), part = "header", border = officer::fp_border(width = 1)) %>%
+    flextable::compose(j = c("Chromosome", "Start Position"), part = "header", use_dot = T, value = as_paragraph(
+      ., as_sup("†")
+    )) %>%
+    #change format of gene_biotype
+    flextable::compose(j = "Gene Type", part = "body", use_dot = T, value = as_paragraph(
+      recode(.,
+        "protein_coding" = "Protein-coding",
+        "pseudogene" = "Pseudogene",
+        "processed_pseudogene" = "Processed Pseudogene",
+        "unprocessed_pseudogene" = "Unprocessed Pseudogene",
+        "transcribed_unprocessed_pseudogene" = "Unprocessed Pseudogene",
+        "transcribed_unitary_pseudogene" = "Unitary Pseudogene",
+        "TEC" = "Unconfirmed",
+      )
+    )) %>%
+    #alternating row colors
+    flextable::bg(i = ~ seq_len(nrow(data)) %% 2 == 1, bg = "grey97") %>%
+    #footer and footnotes
+    flextable::add_footer_lines(NA) %>%
+    flextable::compose(part = "footer", value = as_paragraph(
+      as_sup("† "), "Chromosomes and base pair positions in GRCh38 coordinates.",
+      "\n",
+      as_sup("‡ "), "Qualitative, cell type-specific expression levels of candidate genes in vascular tissue, based on single-cell RNA sequencing data from the Tabula Sapiens consortium. A '⁠–⁠' denotes zero or insignificant expression; '+' denotes expression levels in 1", as_sup("st"), " to 25", as_sup("th"), " percentile compared to all expressed genes in a given cell type; '++' denotes expression in the 25", as_sup("th"), " to 75", as_sup("th"), " percentile; and, '+++' denotes expression in the 75", as_sup("th"), " to 100", as_sup("th"), " percentile."
+    )) %>%
+    flextable::line_spacing(part = "footer", space = 1.5) %>%
+    # Color ABC Score values
+    flextable::bg(j = -c(1:nc), bg = function(x) {
+      rng <- c(0, 100)
+      x <- (as.numeric(x) - rng[1]) / (rng[2] - rng[1])
+      col_ramp_brewer("Purples")(x)
+    }) %>%
+    ajtools::flextable_save("table_singlecell_rel_expr", path = PROJ_ROOT %//% "figures/", overwrite = T)
+  }
+  
+```
+
+## RNA microarray data in PAH vs control patients
+
+**Stearman, R. S. et al. Systems Analysis of the Human Pulmonary Arterial Hypertension Lung Transcriptome. Am J Respir Cell Mol Biol 60, 637-649, doi:10.1165/rcmb.2018-0368OC (2019)**
+
+Data obtained from: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE117261
+
+```{r}
+# load data from GEO file
+GSE117261 <- 
+  GEOquery::getGEO(
+    filename = PROJ_ROOT %//% "../../Archives.nosync/singlecell/NCBI GEO GSE117261 - Stearman et al 2019 Microarray/GSE117261_series_matrix.txt.gz",
+    GSEMatrix = TRUE,
+    getGPL = TRUE
+  )
+
+# load the hemodynamics and other demographic info from the spreadsheet file provided in the supplement of the Stearman paper
+hemo_demo <- read_csv(PROJ_ROOT %//% "../../Archives.nosync/singlecell/NCBI GEO GSE117261 - Stearman et al 2019 Microarray/PAH_hemodynamics_demographics.csv")
+
+# match the sample names in the hemodynamics/demographics table to the file names in the GEO data set
+titles <- GSE117261$title %++% ".CEL"
+hemo_data <- left_join(tibble(title = titles), hemo_demo, by = c("title" = "Filename"))
+
+# identify controls vs PAH
+pah_vs_control <-
+  factor(GSE117261$`clinical_group:ch1`, levels = c("FD", "all PAH"), labels = c("Control", "PAH")) %>%
+  as.character()
+
+# identify feature (gene) properties
+feature_id_table <- Biobase::pData(Biobase::featureData(GSE117261))
+
+# define list of genes to search for
+gene_names <- c(
+  "LINC01914",
+  "PKDCC",
+  "C2orf91",
+  "PLCE1-AS1",
+  "PLCE1",
+  "NOC3L",
+  "TBC1D12",
+  "KANSL1",
+  "MAPT",
+  "RP11-798G7.8",
+  "PTHLH",
+  "SETD8",
+  "ARL17A"
+)
+
+pvr_lm_results <- list()
+pvr_cor_results <- list()
+
+# loop over genes
+for (gene_name in gene_names) {
+  
+  # get the row numbers corresponding the gene (feature)
+  feature_rows <- which(grepl("// " %++% gene_name %++% " //", feature_id_table$gene_assignment, fixed = T))
+  
+  if (length(feature_rows) == 0) {
+    warning("Gene ", gene_name, " not found!")
+    next
+  }
+  
+  if (length(feature_rows) > 1) {
+    warning("Multiple probes for ", gene_name, " found!")
+  }
+  
+  # create a subset of the expression set using the feature rows and convert to a data frame
+  gene_subset <-
+    Biobase::exprs(GSE117261[feature_rows, ]) %>%
+    t() %>%
+    as.data.frame() %>%
+    
+    # rename columns if there are multiple probes found
+    rename_with(function(x) {
+      if (length(x) == 1) gene_name
+      else {
+        gene_name %++% "_Probe_" %++% 1:length(x)
+      }
+    }) %>%
+    
+    # add control vs PAH info
+    cbind(pah_vs_control)
+  
+  # merge with the hemodynamic/demographic data
+  merged_data <-
+    cbind(gene_subset, hemo_data) %>%
+    as_tibble() %>%
+    mutate(PVR = as.numeric(PVR)) %>%
+    filter(pah_vs_control == "PAH") %>%
+    rename("gene_expr" = 1)
+  
+  # perform a linear model fit to the PVR using adjusted gene expression
+  lm_sum <- lm(scale(PVR) ~ scale(gene_expr) + scale(Age) + GENDER, data = merged_data) %>% summary()
+  
+  # perform a correlation test on PVR and gene expresion
+  cor_test <- cor.test(merged_data$gene_expr, merged_data$PVR)
+  
+  # append results of fit testing to lists
+  pvr_lm_results <- append(pvr_lm_results, list("gene_name" = lm_sum))
+  pvr_cor_results <- append(pvr_cor_results, list("gene_name" = cor_test))
+  
+  # loop over each probe
+  for (gene_name_n in gene_subset %>% select(!last_col()) %>% names()) {
+  
+    # create gg plot
+    plot <- 
+      gene_subset %>%
+      ggplot() +
+      aes_string(x = "pah_vs_control", y = gene_name_n, fill = "pah_vs_control", color = "pah_vs_control") +
+      
+      # sina plot
+      ggforce::geom_sina(
+        maxwidth = 0.5,
+        seed = pi/2,
+        show.legend = F,
+        size = 1.25,
+      ) +
+      
+      # +/- standard error lines
+      stat_summary(
+        fun = ~ mean(.x),
+        fun.max = ~ mean(.x) + sd(.x) / sqrt(length(.x)),
+        fun.min = ~ mean(.x) - sd(.x) / sqrt(length(.x)),
+        geom = "errorbar",
+        color = "black",
+        width = 0.25,
+        size = 0.5,
+        show.legend = F
+      ) +
+      
+      # mean line
+      stat_summary(
+        fun = ~ mean(.x),
+        fun.max = ~ mean(.x),
+        fun.min = ~ mean(.x),
+        geom = "crossbar",
+        color = "black",
+        width = 0.5,
+        fatten = 1,
+        show.legend = F
+      ) +
+      
+      # signif testing
+      ggsignif::geom_signif(
+        comparisons = list(c("Control", "PAH")),
+        map_signif_level = function(p) "italic(p) == " %++% scibeautify(p, sig_digits = 2, output_format = "plotmath"),
+        parse = T,
+        test = "wilcox.test",
+        tip_length = 0.05,
+        extend_line = -0.01,
+        margin_top = 0.2,
+        textsize = 0.38 * 7.5,
+        size = 0.5,
+        color = "black"
+      ) +
+      
+      # cosmetic
+      labs(x = NULL, y = "Relative Transcript Abundance") +
+      ggtitle(str_replace_all(gene_name_n, "_Probe_\\d", "")) +
+      scale_color_discrete(direction = -1) +
+      scale_fill_discrete(direction = -1) +
+      scale_y_continuous(expand = expansion(mult = 0.2))
+    
+    # save to disk
+    suppressMessages({
+      plot %>% ajtools::ggfigsave(name = "pah_expr_array_" %++% gene_name_n, path = PROJ_ROOT %//% "figures/pah_expr_array", width = 2.5, height = 2.5, open = F, overwrite = T)
+    })
+  }
+}
+```

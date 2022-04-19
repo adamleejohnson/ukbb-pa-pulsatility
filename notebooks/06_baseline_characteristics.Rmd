@@ -1,0 +1,35 @@
+# 6. Baseline characteristics
+
+Calcualte baseline characteristics for the CMR cohort.
+
+```{r setup, include=F}
+# Common setup
+source("setup.R")
+```
+
+Load merged data frame:
+
+```{r}
+df_merged <- arrow::read_parquet(PROJ_ROOT %//% "data/ukb_cmr_pulsatility_merged.2021_11_19.zst.parquet")
+```
+
+Define baseline characteristics
+
+```{r baseline_characteristics}
+baseline_char <- df_merged %>%
+  transmute(
+    # TrainingSet = row_number() %in% training_set_idx,
+    # All = T,
+    "Age, years" = ukbiobank::age_at_instance_computed(., UKB_Instance),
+    "Sex" = factor(f.31.0.0.Sex, levels = c("Male", "Female")),
+    "Ethnicity" = as_factor(ukbiobank::ethnicity_self_reported(.)),
+    "BMI" = ukbiobank::physio_bmi(., up_to_instance = UKB_Instance),
+    "Hemoglobin A1c, %" = ukbiobank::biomarker_A1c_percent(., up_to_instance = UKB_Instance),
+    # "LDL, mg/dL" = ukbiobank::biomarker_LDL_mgdL(., up_to_instance = UKB_Instance),
+    "CHF" = ukbiobank::diagnosed_chf(., up_to_instance = UKB_Instance),
+    "Hypertension" = ukbiobank::diagnosed_htn(., up_to_instance = UKB_Instance),
+    "COPD" = ukbiobank::diagnosed_copd(., up_to_instance = UKB_Instance),
+    "Diabetes" = ukbiobank::diagnosed_diabetes(., up_to_instance = UKB_Instance),
+    Pulsatility
+  )
+```

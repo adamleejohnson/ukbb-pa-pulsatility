@@ -1,0 +1,235 @@
+# Analyze all secondary analyses
+
+Aggregate all the post-GWAS fine mapping analyses.
+
+```{r setup}
+# Common setup
+source("setup.R")
+```
+
+## Load tables containing results of various secondary analyses
+
+```{r, eval=F}
+candidate_genes_positional <- ajtools::sourceRmd(PROJ_ROOT %//% "notebooks/08_analyze_gwas_results.Rmd")$candidate_genes_positional
+df_coloc_results_merged <- ajtools::sourceRmd(PROJ_ROOT %//% "notebooks/09_analyze_gtex_coloc.Rmd")$df_coloc_results
+eMAGMA_results <- ajtools::sourceRmd(PROJ_ROOT %//% "notebooks/10_analyze_eMAGMA.Rmd")$eMAGMA_results
+ABC_fuma_risk_loci <- ajtools::sourceRmd(PROJ_ROOT %//% "notebooks/11_analyze_ABC.Rmd")$ABC_fuma_risk_loci
+```
+
+## Re-format each table into a common format
+
+```{r, eval=F}
+genes_proximity <- 
+  candidate_genes_positional %>%
+  transmute(
+    gene = symbol,
+    ensembl_id = ensg,
+    chr = ordered(chr, levels = c(1:23, "X"), labels = c(1:22, "X", "X")),
+    fuma_position_locus = GenomicLocus
+  )
+
+genes_emagma <- 
+  eMAGMA_results %>%
+  filter(pval_magma_mode == "multi") %>%
+  select(-numVariants, -pval_magma_mode, -pval_nominal, -tissue) %>%
+  arrange(pval_fdr_adjusted, chr, start) %>%
+  group_by(gene_name, ensembl_gene_id, chr, start, stop) %>%
+  mutate(min_qval = min(pval_fdr_adjusted)) %>%
+  ungroup() %>%
+  distinct(gene_name, ensembl_gene_id, chr, min_qval) %>%
+  transmute(
+    gene = gene_name,
+    ensembl_id = ensembl_gene_id,
+    chr = ordered(chr, levels = paste0("chr", c(1:23, "X")), labels = c(1:22, "X", "X")),
+    emagma_min_qval = min_qval
+  )
+
+genes_coloc <- 
+  df_coloc_results_merged %>%
+  group_by(gtex_ensembl_id) %>%
+  mutate(max_pph4 = max(PP.H4)) %>%
+  ungroup() %>%
+  filter(max_pph4 > 0.5) %>%
+  distinct(gtex_gene, gtex_ensembl_id, locus_chr, max_pph4) %>%
+  transmute(
+    gene = gtex_gene,
+    ensembl_id = xfun::sans_ext(gtex_ensembl_id),
+    chr = ordered(locus_chr, levels = c(1:23, "X"), labels = c(1:22, "X", "X")),
+    coloc_max_pph4 = max_pph4
+  )
+
+genes_abc <- 
+  ABC_fuma_risk_loci %>%
+  filter(ABC.Score > 0.02) %>%
+  group_by(TargetGene, chr) %>%
+  mutate(ABC.Score = max(ABC.Score)) %>%
+  ungroup() %>%
+  distinct(TargetGene, .keep_all = T) %>%
+  transmute(
+    gene = TargetGene,
+    chr = ordered(chr, levels = paste0("chr", c(1:23, "X")), labels = c(1:22, "X", "X")),
+    abc_score = ABC.Score
+  )
+
+# convert gene names in ABC results to Ensembl IDs
+# -- unfortunately, the ABC score lookups do not contain Ensembl IDs
+# -- these steps will look in biomarts for b37, b38, and b38 synonyms for Ensembl IDs
+ensembl_genes_38 <- biomaRt::useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", mirror = "useast")
+ensembl_genes_37 <- biomaRt::useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", GRCh = 37)
+abc_gene_lookups <- local({
+  lookup_values <- tibble(
+    gene = genes_abc$gene,
+    chr = genes_abc$chr
+  )
+  lookup_results <- tibble(
+    gene = character(),
+    chr = character(),
+    ensembl_gene_id = character()
+  )
+  do_lookup <- function(merge_results, values, mart, attr) {
+    merge_results %>% full_join(
+      biomaRt::getBM(
+        attributes = c("ensembl_gene_id", attr, "chromosome_name"),
+        filters = c(attr, "chromosome_name"),
+        values = as.list(values),
+        mart = mart
+      ) %>% mutate(across(chromosome_name, as.character)),
+      by = c("gene" = attr, chr = "chromosome_name", "ensembl_gene_id")
+    )
+  }
+  
+  lookup_results %<>% do_lookup(lookup_values, ensembl_genes_37, "hgnc_symbol") # lookup in ensembl_genes_37
+  lookup_values %<>% anti_join(lookup_results %>% select(gene, chr)) # remove matches
+  lookup_results %<>% do_lookup(lookup_values, ensembl_genes_38, "hgnc_symbol") # lookup in ensembl_genes_38
+  lookup_values %<>% anti_join(lookup_results %>% select(gene, chr)) # remove matches
+  lookup_results %<>% do_lookup(lookup_values, ensembl_genes_38, "external_synonym") # lookup in ensembl_genes_38 with synonyms
+  lookup_results
+})
+
+genes_abc %<>%
+  left_join(abc_gene_lookups, by = c("gene" , "chr")) %>%
+  rename("ensembl_id" = "ensembl_gene_id")
+```
+
+## Merge the tables by gene ID
+
+```{r, eval=F}
+# join by ensembl id
+genes_ALL <- 
+  genes_proximity %>%
+  full_join(genes_emagma, by = c("chr", "ensembl_id")) %>%
+  full_join(genes_coloc, by = c("chr", "ensembl_id")) %>%
+  full_join(genes_abc, by = c("chr", "ensembl_id")) %>%
+  rowwise("chr", "ensembl_id") %>%
+  mutate(common_genes = {
+    genes <- c_across(starts_with("gene"))
+    genes <- genes[!is.na(genes)]
+    genes <- unique(genes)
+    genes <- genes[!startsWith(genes, "ENSG")]
+    g_dot <- grepl(".", genes, fixed = T)
+    if (any(!g_dot)) genes <- genes[!g_dot]
+    g_LINC <- grepl("LINC", genes, fixed = T)
+    if (any(!g_LINC)) genes <- genes[!g_LINC]
+    genes[1] %||% NA
+  }) %>%
+  ungroup() %>%
+  select(-starts_with("gene")) %>%
+  relocate(gene = common_genes)
+
+# get gene type & position
+genes_ALL %<>%
+  left_join(
+    biomaRt::getBM(
+      attributes = c("gene_biotype", "start_position", "ensembl_gene_id", "description"),
+      filters = c("ensembl_gene_id"),
+      values  = genes_ALL$ensembl_id,
+      mart = ensembl_genes_38
+    ),
+    by = c("ensembl_id" = "ensembl_gene_id")
+  ) %>%
+  relocate(gene_biotype, description, .after = gene) %>%
+  mutate(description = str_remove(description, " \\[.*\\]")) %>%
+  mutate(description = ifelse(is.na(description), NA, paste0(toupper(substr(description, 1, 1)), substr(description, 2, nchar(description))))) %>%
+  mutate(gene = if_else(ensembl_id == "ENSG00000278733", "CCDC91-AS", gene))
+
+# Save this table to disk
+genes_ALL %>% write_tsv(ajtools::file_datestamp("summary_genes_merged_analyses.txt.gz", path = PROJ_ROOT %//% "analyses"))
+```
+
+## Modify summary genes table to use a scoring system
+
+```{r}
+genes_ALL <- vroom(PROJ_ROOT %//% "analyses/summary_genes_merged_analyses.2022_01_18.txt.gz", show_col_types = F)
+
+genes_ALL_scored <- 
+  genes_ALL %>%
+  filter(!endsWith(gene_biotype, "pseudogene")) %>%
+  mutate(
+    hit_positional = !is.na(fuma_position_locus),
+    hit_emagma = !is.na(emagma_min_qval),
+    hit_coloc_50 = !is.na(coloc_max_pph4) & coloc_max_pph4 > 0.5,
+    hit_coloc_80 = !is.na(coloc_max_pph4) & coloc_max_pph4 > 0.8,
+    hit_abc = !is.na(abc_score)
+  ) %>%
+  rowwise() %>%
+  mutate(score = sum(c_across(starts_with("hit")))) %>%
+  ungroup() %>%
+  arrange(-score, as.numeric(chr), emagma_min_qval, -coloc_max_pph4,  -abc_score) %>%
+  select(gene, ensembl_id, gene_biotype, description, chr, start_position, starts_with("hit"), score)
+```
+
+## Make table
+
+```{r, eval=F}
+genes_ALL_scored %>%
+  select(-description) %>%
+  filter(score > 1) %>%
+{
+  hit_cols <- which(startsWith(names(.), "hit_"))
+  identity(.) %>%
+    rename(
+      "Gene Symbol" = gene,
+      "Ensembl ID" = ensembl_id,
+      "Gene Type" = gene_biotype,
+      "Chr" = chr,
+      "Start Position" = start_position,
+      "Positional\nMapping" = hit_positional,
+      "eMAGMA" = hit_emagma,
+      "Colocalization\n(PP > 0.50)" = hit_coloc_50,
+      "Colocalization\n(PP > 0.80)" = hit_coloc_80,
+      "ABC" = hit_abc,
+      "Score" = score
+    ) %>%
+    flextable::flextable() %>%
+    flextable::align(j = -1, part = "all", align = "center") %>%
+    
+    # display dashes for NA values
+    flextable::compose(j = c("Gene Symbol", "Ensembl ID"), use_dot = T, value = as_paragraph(ifelse(is.na(.), "⁠–", .))) %>%
+    
+    # display checkmarks
+    flextable::compose(j = hit_cols, use_dot = T, value = as_paragraph(ifelse(., "✓", NA))) %>%
+    flextable::vline(j = c(min(hit_cols) - 1, max(hit_cols))) %>%
+    
+    # change format of gene_biotype
+    flextable::compose(j = "Gene Type", part = "body", use_dot = T, value = as_paragraph(
+      recode(.,
+        "protein_coding" = "Protein-coding",
+        "pseudogene" = "Pseudogene",
+        "processed_pseudogene" = "Processed Pseudogene",
+        "unprocessed_pseudogene" = "Unprocessed Pseudogene",
+        "transcribed_unprocessed_pseudogene" = "Unprocessed Pseudogene",
+        "transcribed_unitary_pseudogene" = "Unitary Pseudogene",
+        "TEC" = "Unconfirmed",
+      )
+    )) %>%
+    
+    # alternating row colors
+    flextable::bg(i = ~ seq_len(nrow(data)) %% 2 == 1, bg = "grey97") %>%
+    
+    # left-align descriptions
+    flextable::align(j = "Description", part = "body", align = "left") %>%
+    ajtools::flextable_save("table_summary_genes_scored", path = PROJ_ROOT %//% "figures/", overwrite = T) 
+}
+```
+
+

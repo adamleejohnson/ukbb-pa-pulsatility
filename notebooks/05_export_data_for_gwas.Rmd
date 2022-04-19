@@ -1,0 +1,117 @@
+# 5. Export Data for GWAS
+
+In this notebook, we'll perform some QC-based exclusions on our CMR population to generate a GWAS cohort. We'll export all the required data for the GWAS (phenotype, covariates, principal components, etc.).
+
+```{r setup, include=FALSE}
+# Common setup
+source("setup.R")
+```
+
+Load the merged data frame containing pulsatility, calculated genetic principal componenets, covariates, and UKB phenotype data.
+
+```{r}
+df_merged_pca <- arrow::read_parquet("data/ukb_cmr_pulsatility_and_flashPCA.2021_11_19.zst.parquet")
+```
+
+## Export GWAS Data
+
+Define a function to export data to a phenotype and covariates file, as required for input into Bolt-LMM. Note that in the covariates file, participants are filtered-out based on reported/genetic sex mismatch and excessive kinship.
+
+```{r generate_bolt_data_sets}
+# Define function to write phenotypes and covariates to file in correct BOLT format
+generate_bolt_data_sets <- function(data, file_prefix) {
+  # PHENOTYPES
+  # we only end up using the Pulsatility phenotype, but these others are there in case we want to look at these later
+  data %>%
+    transmute(
+      FID = f.eid,
+      IID = f.eid,
+      Pulsatility = Pulsatility,
+      BSA = ukbiobank::physio_bsa(., up_to_instance = UKB_Instance),
+      EllipticalMaxArea = pi * (Minor_axis_at_max_cm)^2,
+      EllipticalMinArea = pi * (Minor_axis_at_min_cm)^2,
+      EllipticalMaxAreaIndex = EllipticalMaxArea / BSA,
+      EllipticalMinAreaIndex = EllipticalMinArea / BSA,
+      FWHM = FWHM_systole_frames,
+      EccMax = Eccentricity_at_max
+    ) %>%
+    write_tsv(ajtools::file_datestamp("data/bolt-lmm/bolt_phenotypes." %++% file_prefix %++% ".tsv.gz"))
+
+  # COVARIATES
+  data %>%
+    mutate(
+      ageAtStudy = ukbiobank::age_at_instance(., instance_num = UKB_Instance),
+      GenoArray = ifelse(f.22000.0.0.Genotype_measurement_batch > 0, "Axiom", "BiLEVE"),
+      BMI = ukbiobank::physio_bmi(., up_to_instance = UKB_Instance),
+      BSA = ukbiobank::physio_bsa(., up_to_instance = UKB_Instance),
+      HR = ukbiobank::measurement_lookup_with_alt(.,
+        measurement_col = f.22426.2.0.Average_heart_rate,
+        measurement_col_alt = f.12673.2.0.Heart_rate_during_PWA,
+        up_to_instance = UKB_Instance,
+        combine_array = "mean"
+      )
+    ) %>%
+    filter(
+      f.31.0.0.Sex == f.22001.0.0.Genetic_sex,
+      f.22021.0.0.Genetic_kinship_to_other_participants != "Ten or more third-degree relatives identified"
+    ) %>%
+    select(
+      FID = f.eid,
+      IID = f.eid,
+      Age = ageAtStudy,
+      Sex = f.31.0.0.Sex,
+      GenoArray,
+      HR,
+      BMI,
+      BSA,
+      !!paste0("PC", 1:10)
+    ) %>%
+    write_tsv(ajtools::file_datestamp("data/bolt-lmm/bolt_covariates." %++% file_prefix %++% ".tsv.gz"))
+}
+```
+
+Export general GWAS data (for our GWAS, we exclude patients with CHF, COPD, pHTN, and PE):
+
+```{r, eval=F}
+# Generate phenotype/covariate files for subjects:
+# (minus PH, COPD, PE)
+# (minus outliers identified in QC phase)
+df_merged_pca %>%
+  mutate(
+    dx_CHF = ukbiobank::diagnosed_chf(., up_to_instance = UKB_Instance),
+    dx_pHTN = ukbiobank::diagnosed_pHTN(., up_to_instance = UKB_Instance),
+    dx_COPD = ukbiobank::diagnosed_copd(., up_to_instance = UKB_Instance),
+    dx_PE = ukbiobank::diagnosed_pulm_embolism(., up_to_instance = UKB_Instance)
+  ) %>%
+  filter(
+    !dx_CHF,
+    !dx_pHTN,
+    !dx_COPD,
+    !dx_PE
+  ) %>%
+  generate_bolt_data_sets("flashPCA.minus_chf_phtn_copd_pe.with_BSA_and_HR")
+```
+
+Export data for sensitivity analysis (top 2.5% and bottom 2.5% percentiles in pulsatility removed):
+
+```{r, eval=F}
+# Generate phenotype/covariate files for subjects:
+# (minus PH, COPD, PE)
+# (minus outliers identified in QC phase)
+df_merged_pca %>%
+  mutate(
+    dx_CHF = ukbiobank::diagnosed_chf(., up_to_instance = UKB_Instance),
+    dx_pHTN = ukbiobank::diagnosed_pHTN(.),
+    dx_COPD = ukbiobank::diagnosed_copd(.),
+    dx_PE = ukbiobank::diagnosed_pulm_embolism(.)
+  ) %>%
+  filter(
+    !dx_CHF,
+    !dx_pHTN,
+    !dx_COPD,
+    !dx_PE,
+    Pulsatility > quantile(Pulsatility, 0.025),
+    Pulsatility < quantile(Pulsatility, 1 - 0.025)
+  ) %>%
+  generate_bolt_data_sets("minus_outliers_flashPCA_pHTN_COPD_PE_sensitivity")
+```

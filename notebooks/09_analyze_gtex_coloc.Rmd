@@ -1,0 +1,804 @@
+# 9. eQTL colocalization
+
+```{r setup}
+# Common setup
+source("setup.R")
+library(locuscomparer)
+```
+
+## SETUP FOR COLOC
+
+### Get the standard devation of our gwas trait (pulsatility), needed for coloc
+
+```{r}
+sdY_pulsatility <-
+  arrow::read_parquet(PROJ_ROOT %//% "data/ukb_cmr_pulsatility_merged.2021_11_19.zst.parquet", col_select = "Pulsatility") %>%
+  pull(Pulsatility) %>%
+  sd()
+```
+
+### Load GWAS data
+
+Load the GWAS data, including our candidate SNPs from FUMA, and our GWAS summary statistics. This is imported from another Rmd notebook:
+
+```{r}
+gwas_analysis <- ajtools::sourceRmd(PROJ_ROOT %//% "notebooks/08_analyze_gwas_results.Rmd")
+fuma_cand_snps <- gwas_analysis$candidate_snps
+fuma_risk_loci <- gwas_analysis$risk_loci
+gwas_summary <- gwas_analysis$gwas_summary
+remove(gwas_analysis)
+```
+
+### Helper functions
+
+```{r}
+# Find the `parquet` file that was download from GTEx/Google Cloud Platform (I converted them all to .zst.parquet, and added some annotations like hg19 coordinates and gene symbols).
+gtex_tissue_chrN <- function(tissue = tissue_name, n) {
+  if (n == 23) n <- "X"
+  message("   > Loading GTEx data for chr", n, ", tissue ", tissue)
+  arrow::read_parquet(
+    PROJ_ROOT %//%
+      "../../Archives.nosync/GTEx/GTEx_Analysis_v8_EUR_eQTL_all_associations/GTEx_Analysis_v8_EUR_eQTL_annotated" %//%
+      as.character(tissue) %++% ".v8.EUR.allpairs.chr" %++% as.character(n) %++% "_annotated.zst.parquet",
+    col_select = c(phenotype_id, external_gene_name, variant_id_b37, pval_nominal, slope, slope_se)
+  )
+}
+
+# silent version of coloc::coloc.abf()
+# -- suppress verbose messages from coloc.abf
+runcoloc_silently <- function(...) purrr::quietly(coloc::coloc.abf)(...)$result
+
+# silent, error-free version of coloc::runsusie()
+# -- runsusie throws an error when it doesn't converge, which we can ignore and call it a negative result
+# -- make sure runsusie is working as expected before using this error-free wrapper, though
+runsusie_silently <- function(...) purrr::quietly(purrr::safely(coloc::runsusie))(...)$result$result
+
+# custom patchwork legend for locuscompare
+lc_legend <- {
+  data.frame(
+    expand.grid(x = 0:5, y = 0:1),
+    fill = c(rep(NA, 6), "blue4", "skyblue", "darkgreen", "orange", "red", NA),
+    color = c(rep(NA, 6), rep("black", 5), NA),
+    label1 = c("", 0.2 * 1:4, rep("", 7)),
+    label2 = c(rep("", 11), "r^2")
+  ) %>%
+    {
+      ggplot(.) +
+        geom_rect(aes(xmin = x, xmax = x + 1, ymin = y, ymax = y + 1), fill = .$fill, color = .$color) +
+        geom_text(aes(x = x, y = y + 0.8), label = .$label1, vjust = 1, hjust = 0.5, size = 0.35 * calc_element("axis.title", theme_get())$size) +
+        geom_text(aes(x = x + 0.2, y = y + 0.5), label = .$label2, parse = T, vjust = 0.5, hjust = 0, size = 0.35 * calc_element("axis.title", theme_get())$size) +
+        scale_x_continuous(expand = expansion()) +
+        scale_y_continuous(expand = expansion()) +
+        theme(
+          legend.position = "none",
+          axis.line = element_blank(),
+          axis.text = element_blank(),
+          axis.title = element_blank(),
+          axis.ticks = element_blank(),
+          plot.margin = margin(),
+          plot.background = element_rect(fill = "white", color = NA)
+        )
+    } %>%
+    inset_element(0.02, 0.98 - 2 * 0.03, 0.02 + 18 * 0.03, 0.98, clip = F)
+}
+```
+
+### Coloc parameters
+
+```{r}
+# GTEx tissues
+tissues <- c(
+  "Cells_Cultured_fibroblasts",
+  "Heart_Left_Ventricle",
+  "Heart_Atrial_Appendage",
+  "Artery_Aorta",
+  "Artery_Coronary",
+  "Artery_Tibial",
+  "Lung"
+)
+
+# minimum width for each risk locus
+window_size <- 1e6 # 1 Mb
+
+# where the plink1 files for 1000G data is stored, used when calculating LD r values
+# --each file should be named chrN_phase3.bed/.bim/.fam, or chrN_phase3.tar.zst
+genofiles_1000g_root <- PROJ_ROOT %//% "../../Archives.nosync/1000G/plink1_bed"
+
+# where to look for/save LD tables for each locus
+ld_table_lookup_root <- PROJ_ROOT %//% "analyses/LDtables"
+```
+
+## COLOC (single-variant)
+
+Loop over all FUMA risk loci and perform coloc analysis
+
+```{r, eval=F}
+df_coloc_results <- tibble()
+
+# output location
+save_path_root <- PROJ_ROOT %//% "analyses/coloc_single_variant_v2"
+
+for (tissue_name in tissues) {
+  current_chr <- NULL
+  gtex_tissue_chrN_file <- NULL
+
+  ## ------------------------------------ loop over risk loci ------------------------------------
+  for (risk_locus_n in fuma_risk_loci$GenomicLocus) {
+
+    ## ---- get boundaries of risk locus ----
+    risk_locus <- fuma_risk_loci %>% filter(GenomicLocus == risk_locus_n)
+    chr <- risk_locus$chr
+    len <- risk_locus$end - risk_locus$start
+    # make the locus a minimum of window_size in width
+    padding <- max(window_size - len, 0)
+    min_pos <- risk_locus$start - padding / 2
+    max_pos <- risk_locus$end + padding / 2
+    message("> Processing risk locus ", risk_locus_n, " of ", nrow(fuma_risk_loci), " (", tissue_name, ", chr ", chr, ")")
+
+    ## ---- load chr N gtex data ----
+    if (!identical(current_chr, chr) || is.null(gtex_tissue_chrN_file)) {
+      gtex_tissue_chrN_file <- gtex_tissue_chrN(tissue_name, chr)
+      current_chr <- chr
+    }
+
+    ## ---- create subset of gtex and gwas data for this locus ----
+    gwas_summary_risklocusN <-
+      gwas_summary %>%
+      filter(CHR == chr) %>%
+      filter(BP >= min_pos, BP <= max_pos) %>%
+      mutate(
+        variant_id_b37 = paste(CHR, BP, ALLELE0_REF, ALLELE1_ALT, "b37", sep = "_")
+      )
+
+    gtex_tissue_risklocusN <-
+      gtex_tissue_chrN_file %>%
+      filter(variant_id_b37 %in% gwas_summary_risklocusN$variant_id_b37)
+
+    ## ---- get LD info for these snps ----
+    ld_cache_file <- ld_table_lookup_root %//% "LDtable_r_1000G_EUR_FUMAlocus" %++% formatC(risk_locus_n, width = 2, flag = "0") %++% "_" %++% "chr" %++% chr %++% ".zst.parquet"
+    if (file.exists(ld_cache_file)) {
+      ld <- arrow::read_parquet(ld_cache_file)
+    } else {
+      ld <- ajtools::ld_matrix_1000g_plink(
+        query_snps = gwas_summary_risklocusN$SNP %>% str_replace("^([^:]+:\\d+)_.*", "chr\\1"),
+        genofile = genofiles_1000g_root %//% "chr" %++% chr %++% "_phase3.tar.zst",
+        pop = "EUR",
+        mode = "r",
+        sys.path = "/opt/homebrew/bin"
+      ) %>%
+        ajtools::write_parquet_zstd(ld_cache_file, 22)
+    }
+    ld_matrix <- ajtools::ld_list_to_matrix(ld, "SNP_A", "SNP_B", "R")
+    remove(ld)
+
+    ## ------------------------------------ loop over genes in the GTEx locus ------------------------------------
+    cand_genes <- gtex_tissue_risklocusN$phenotype_id %>% unique()
+    for (j in seq_along(cand_genes)) {
+      search_gene <- cand_genes[j]
+
+      ## ---- filter gtex_locus by gene ID ----
+      gtex_locus_gene <- gtex_tissue_risklocusN %>%
+        filter(phenotype_id == search_gene) %>%
+        filter(!is.na(pval_nominal) & !is.na(slope) & !is.na(slope_se))
+
+      ## ---- get common gene symbol ----
+      gene_name <-
+        if (is.na(gtex_locus_gene$external_gene_name[1]) || gtex_locus_gene$external_gene_name[1] == "") {
+          gtex_locus_gene$phenotype_id[1] %>%
+            as.character() %>%
+            xfun::sans_ext()
+        } else {
+          gtex_locus_gene$external_gene_name[1] %>% as.character()
+        }
+      message("      > analyzing gene ", formatC(j, width = 3, flag = "0"), "/", formatC(length(cand_genes), width = 3, flag = "0"), ": ", gene_name)
+
+      if (!any(gtex_locus_gene$pval_nominal < 0.05)) next
+
+      ## ---- merge gtex and gwas loci by unique variant ID (allows for multi-allelic snps) ----
+      locuscompare_data <- inner_join(gwas_summary_risklocusN, gtex_locus_gene, by = c("variant_id_b37"))
+      remove(gtex_locus_gene)
+      if (nrow(locuscompare_data) == 0) next
+
+      ## ---- reformat data for coloc and locus compare ----
+      locuscompare_data %<>%
+        transmute(
+          rsid = SNP,
+          logp1 = -log10(P_BOLT_LMM_INF),
+          logp2 = -log10(pval_nominal),
+          chr = CHR,
+          pos = BP,
+          beta_gwas = BETA,
+          varbeta_gwas = SE^2,
+          beta_gtex = slope,
+          varbeta_gtex = slope_se^2,
+          variant_id_b37,
+        ) %>%
+        filter(
+          !is.na(logp1) & !is.na(logp2) & !is.na(beta_gwas) & !is.na(varbeta_gwas) & !is.na(beta_gtex) & !is.na(varbeta_gtex)
+        )
+
+      ## ---- generate coloc data sets ----
+      coloc_data_gwas <- list(
+        beta = locuscompare_data$beta_gwas,
+        varbeta = locuscompare_data$varbeta_gwas,
+        snp = locuscompare_data$variant_id_b37,
+        position = locuscompare_data$pos,
+        type = "quant",
+        sdY = sdY_pulsatility
+      )
+      coloc_data_gtex <- list(
+        beta = locuscompare_data$beta_gtex,
+        varbeta = locuscompare_data$varbeta_gtex,
+        snp = locuscompare_data$variant_id_b37,
+        position = locuscompare_data$pos,
+        type = "quant",
+        sdY = 1
+      )
+
+      ## ---- RUN COLOC ----
+      coloc_res <- runcoloc_silently(dataset1 = coloc_data_gwas, dataset2 = coloc_data_gtex)
+      coloc_H4_posterior <- coloc_res$summary["PP.H4.abf"]
+
+      ## ---- store coloc results ----
+      coloc_data <- tibble(
+        fuma_locus_idx = risk_locus_n,
+        gtex_tissue = tissue_name,
+        gtex_gene = gene_name,
+        gtex_ensembl_id = search_gene,
+        locus_chr = chr,
+        locus_start = min_pos,
+        locus_end = max_pos,
+        locus_min_gwasP = 10^(-(max(locuscompare_data$logp1))),
+        locus_min_gtexP = 10^(-(max(locuscompare_data$logp2))),
+        
+        # store the posterior probabilities
+        PP.H0 = coloc_res$summary["PP.H0.abf"],
+        PP.H1 = coloc_res$summary["PP.H1.abf"],
+        PP.H2 = coloc_res$summary["PP.H2.abf"],
+        PP.H3 = coloc_res$summary["PP.H3.abf"],
+        PP.H4 = coloc_res$summary["PP.H4.abf"],
+        
+        # store the snps with the highest snp-level posterior probability
+        max_snp_PPH4_rsid = with(coloc_res$results, {
+          locuscompare_data %>%
+            filter(variant_id_b37 == snp[which.max(SNP.PP.H4)]) %>%
+            pull(rsid)
+        }),
+        max_snp_PPH4 = with(coloc_res$results, SNP.PP.H4[which.max(SNP.PP.H4)]),
+        
+        # store the correlation between z-scores for the phenotype and the expression data
+        zscore_cor = with(coloc_res$results, cor(z.df1, z.df2)),
+        zscore_cor_top5pct = with(coloc_res$results %>% filter(SNP.PP.H4 > quantile(SNP.PP.H4, .95)), cor(z.df1, z.df2)),
+      )
+
+      # save results to dataframe
+      df_coloc_results %<>% bind_rows(coloc_data)
+
+      ## ------------------------------------ plot and save data if PP > 0.8 ------------------------------------
+      if (coloc_H4_posterior > 0.8) {
+
+        ## ---- save data ----
+        save_path <-
+          save_path_root %//%
+          str_replace_all(tissue_name, "_", "") %++% "_" %++%
+          "chr" %++% chr %++% "_" %++%
+          "FumaRiskLocus" %++% formatC(risk_locus_n, width = 2, flag = "0")
+        save_name <-
+          str_replace_all(tissue_name, "_", "") %++% "_chr" %++% chr %++% "_" %++% gene_name
+        dir.create(save_path, showWarnings = F, recursive = T)
+        write_rds(coloc_res, save_path %//% save_name %++% ".coloc.rds", compress = "xz", compression = 9)
+
+        ## ---- make sensitivity plots ----
+        pdf(
+          file = save_path %//% save_name %++% ".coloc.sensitivity.pdf",
+          width = 6.5, height = 6.5,
+          title = "coloc Sensitivity Analysis"
+        )
+        suppressMessages(coloc::sensitivity(coloc_res, rule = "H4 > 0.8"))
+        dev.off()
+
+        # identify the snp with the max PPH4
+        max_row <- which.max(coloc_res$results$SNP.PP.H4)
+        snp_max_PPH4 <- coloc_res$results$snp[max_row]
+        snp_max_PPH4 <- locuscompare_data %>%
+          filter(variant_id_b37 == snp_max_PPH4) %>%
+          pull(rsid)
+
+        ## ---- make locuscompare plot with each cand SNP ----
+        message("         > saving plots")
+        cand_snps_risklocusN <- fuma_cand_snps %>%
+          filter(GenomicLocus == risk_locus_n) %>%
+          pull(rsID)
+        pb <- txtProgressBar(style = 3, min = 0, max = length(cand_snps_risklocusN))
+        for (i in seq_along(cand_snps_risklocusN)) {
+          snp_rsID <- cand_snps_risklocusN[i]
+
+          setTxtProgressBar(pb, i)
+
+          is_lead <- any(str_split_fixed(risk_locus$IndSigSNPs, ";", Inf)[1, ] == snp_rsID)
+          is_maxPPH4 <- (snp_rsID == snp_max_PPH4)
+          targetSNP_in_locus <- any(locuscompare_data$rsid == snp_rsID)
+
+          if (targetSNP_in_locus) {
+            save_name <-
+              str_replace_all(tissue_name, "_", "") %++% "_chr" %++% chr %++% "_" %++% gene_name %++% "_" %++%
+              str_replace_all(snp_rsID, ":", "_") %++% (if (is_lead) "_lead" else "") %++% (if (is_maxPPH4) "_maxPPH4" else "")
+
+            r <- locuscomparer::make_combined_plot(
+              locuscompare_data %>% select(rsid, logp1, logp2, chr, pos),
+              title1 = "Pulsatility GWAS:",
+              title2 = paste0("eQTL ", gene_name, " / ", str_replace_all(tissue_name, "_", " "), ":"),
+              ld = tibble(SNP_A = snp_rsID, SNP_B = colnames(ld_matrix), R2 = ld_matrix[match(snp_rsID, colnames(ld_matrix)), ]^2),
+              chr = chr,
+              snp = snp_rsID,
+              combine = FALSE,
+              legend = FALSE
+            )
+            lc_patchwork <- (r$locuscompare + lc_legend) | (r$locuszoom1 / r$locuszoom2) & theme(axis.text = element_text(color = "black"))
+            suppressMessages(invisible(ajtools::ggfigsave(
+              lc_patchwork,
+              name = save_name,
+              path = save_path,
+              format = c("png", "rds"),
+              overwrite = T,
+              width = 6.5,
+              height = 6.5,
+              dpi = 300
+            )))
+            remove(r, lc_patchwork)
+          }
+        }
+        close(pb)
+      }
+    }
+  }
+}
+
+# post-processing; attach some info from the FUMA file about the genomic risk loci & save to disk
+df_coloc_results %<>%
+  left_join(
+    fuma_risk_loci %>%
+      select(
+        "idx" = GenomicLocus,
+        start, end, nSNPs, LeadSNPs
+      ) %>%
+      rename_with(~ paste0("fuma_locus_", .x)),
+    by = "fuma_locus_idx"
+  ) %>%
+  relocate(starts_with("fuma"), .after = "fuma_locus_idx") %>%
+  write_tsv(ajtools::file_datestamp(basename(save_path_root) %++% "_results.txt.gz", path = save_path_root))
+```
+
+### Load coloc (single variant) results
+
+```{r}
+df_coloc_results <- vroom(PROJ_ROOT %//% "analyses/coloc_single_variant/coloc_single_variant_v2_results.2022_03_24a.txt.gz", show_col_types = F)
+```
+
+## COLOC-SuSiE
+
+Loop over all FUMA risk loci and perform coloc with SuSiE. This is a variation on the above that allows for multiple causal variants. A credible set of SNPs is identified for the GWAS and eQTL traits, and the posterior probability of H4 for each pair of CSs is calculated.
+
+```{r, eval=F}
+df_coloc.susie_results <- tibble()
+
+# where to save results and plots
+save_path_root <- PROJ_ROOT %//% "analyses/coloc_SuSiE_50"
+
+# a lower coverage allows us to detect weaker signals; USE CAUTION
+susie_coverage <- 0.95
+
+# ## for debugging
+# tissue_name <- "Lung"
+# risk_locus_n <- 10
+# search_gene <- gtex_tissue_chrN(tissue_name, 12) %>% filter(external_gene_name == "PTHLH") %>% pull(phenotype_id) %>% `[`(1)
+
+for (tissue_name in tissues) {
+  current_chr <- NULL
+  gtex_tissue_chrN_file <- NULL
+
+  ## ------------------------------------ loop over risk loci ------------------------------------
+  for (risk_locus_n in fuma_risk_loci$GenomicLocus) {
+    risk_locus <- fuma_risk_loci %>% filter(GenomicLocus == risk_locus_n)
+    chr <- risk_locus$chr
+    message("> Processing risk locus ", risk_locus_n, " of ", nrow(fuma_risk_loci), " (", tissue_name, ", chr ", chr, ")")
+
+    ## ---- get boundaries of risk locus ----
+    # make the locus a minimum of window_size in width
+    len <- risk_locus$end - risk_locus$start
+    padding <- max(window_size - len, 0)
+    min_pos <- risk_locus$start - floor(padding / 2)
+    max_pos <- risk_locus$end + floor(padding / 2)
+
+    ## ---- load annotated, tissue-specific, gtex data for chromosome N ----
+    if (!identical(current_chr, chr) || is.null(gtex_tissue_chrN_file)) {
+      gtex_tissue_chrN_file <- gtex_tissue_chrN(tissue_name, chr)
+      current_chr <- chr
+    }
+
+    ## ---- create subsets of gwas and gtex data for this locus ----
+    gwas_summary_risklocusN <-
+      gwas_summary %>%
+      filter(CHR == chr) %>%
+      filter(BP >= min_pos, BP <= max_pos) %>%
+      # create a unique variant ID in REF_ALT format (will use this to align with the gtex snps, which are labeled in this format)
+      mutate(
+        variant_id_b37 = paste(CHR, BP, ALLELE0_REF, ALLELE1_ALT, "b37", sep = "_")
+      ) %>%
+      filter(!is.na(P_BOLT_LMM_INF) & !is.na(BETA) & !is.na(SE))
+
+    gtex_tissue_risklocusN <-
+      gtex_tissue_chrN_file %>%
+      filter(variant_id_b37 %in% gwas_summary_risklocusN$variant_id_b37) %>%
+      filter(!is.na(pval_nominal) & !is.na(slope) & !is.na(slope_se))
+
+    ## ---- get signed LD info for these snps ----
+    ld_cache_file <- ld_table_lookup_root %//% "LDtable_r_1000G_EUR_FUMAlocus" %++% formatC(risk_locus_n, width = 2, flag = "0") %++% "_" %++% "chr" %++% chr %++% ".zst.parquet"
+    if (file.exists(ld_cache_file)) {
+      ld <- arrow::read_parquet(ld_cache_file)
+    } else {
+      ld <- ajtools::ld_matrix_1000g_plink(
+        query_snps = gwas_summary_risklocusN$SNP %>% str_replace("^([^:]+:\\d+)_.*", "chr\\1"),
+        genofile = genofiles_1000g_root %//% "chr" %++% chr %++% "_phase3.tar.zst",
+        pop = "EUR",
+        mode = "r",
+        sys.path = "/opt/homebrew/bin"
+      ) %>%
+        ajtools::write_parquet_zstd(ld_cache_file, 22)
+    }
+    ld_matrix <- ajtools::ld_list_to_matrix(ld, "SNP_A", "SNP_B", "R")
+    ld_not_missing <- apply(ld_matrix, 1, function(x) all(!is.na(x)))
+    ld_matrix <- ld_matrix[ld_not_missing, ld_not_missing]
+    remove(ld, ld_not_missing)
+
+    ## ------------------------------------ loop over genes in the GTEx locus ------------------------------------
+    cand_genes <- gtex_tissue_risklocusN$phenotype_id %>% unique()
+    for (j in seq_along(cand_genes)) {
+      search_gene <- cand_genes[j]
+
+      ## ---- filter gtex_locus by gene ID ----
+      gtex_locus_gene <-
+        gtex_tissue_risklocusN %>%
+        filter(phenotype_id == search_gene)
+
+      ## ---- get gene symbol ----
+      gene_name <-
+        if (is.na(gtex_locus_gene$external_gene_name[1]) || gtex_locus_gene$external_gene_name[1] == "") {
+          gtex_locus_gene$phenotype_id[1] %>%
+            as.character() %>%
+            xfun::sans_ext()
+        } else {
+          gtex_locus_gene$external_gene_name[1] %>% as.character()
+        }
+      message("      > analyzing gene ", formatC(j, width = 3, flag = "0"), "/", formatC(length(cand_genes), width = 3, flag = "0"), ": ", gene_name)
+
+      if (!any(gtex_locus_gene$pval_nominal < 0.05)) next
+
+      ## ---- merge gtex and gwas loci by unique variant ID ----
+      locuscompare_data <- inner_join(gwas_summary_risklocusN, gtex_locus_gene, by = c("variant_id_b37"))
+      if (nrow(locuscompare_data) == 0) next
+      remove(gtex_locus_gene)
+
+      ## ---- reformat data for coloc and locus compare ----
+      locuscompare_data %<>%
+        transmute(
+          rsid = SNP,
+          logp1 = -log10(P_BOLT_LMM_INF),
+          logp2 = -log10(pval_nominal),
+          chr = CHR,
+          pos = BP,
+          beta_gwas = BETA,
+          varbeta_gwas = SE^2,
+          beta_gtex = slope,
+          varbeta_gtex = slope_se^2,
+          variant_id_b37,
+        )
+
+      ## ---- construct LD matrix for coloc SuSIE ----
+      # convert rsid to variant_id_b37
+      locuscompare_names <-
+        inner_join(
+          tibble("rsid" = dimnames(ld_matrix)[[1]]),
+          locuscompare_data %>% distinct(rsid, .keep_all = T),
+          by = "rsid"
+        ) %>%
+        select(rsid, variant_id_b37)
+      ld_matrix_susie <- ld_matrix[locuscompare_names$rsid, locuscompare_names$rsid]
+      dimnames(ld_matrix_susie) <- list(locuscompare_names$variant_id_b37, locuscompare_names$variant_id_b37)
+
+      # make sure LD matrix and locuscompare_data match
+      locuscompare_data %<>% filter(variant_id_b37 %in% locuscompare_names$variant_id_b37)
+
+      ## ---- generate coloc data sets ----
+      coloc_data_gwas <- list(
+        beta = locuscompare_data$beta_gwas,
+        varbeta = locuscompare_data$varbeta_gwas,
+        snp = locuscompare_data$variant_id_b37,
+        position = locuscompare_data$pos,
+        type = "quant",
+        sdY = sdY_pulsatility,
+        LD = ld_matrix_susie
+      )
+      coloc_data_gtex <- list(
+        beta = locuscompare_data$beta_gtex,
+        varbeta = locuscompare_data$varbeta_gtex,
+        snp = locuscompare_data$variant_id_b37,
+        position = locuscompare_data$pos,
+        type = "quant",
+        sdY = 1,
+        LD = ld_matrix_susie
+      )
+      remove(ld_matrix_susie)
+
+      ## ------------------------------------ RUN COLOC SuSiE ------------------------------------
+      # run the SuSiE IBSS algorithm for each dataset, which will identify credible sets of SNPs for GWAS and GTEx
+      # susie_gwas <- coloc::runsusie(coloc_data_gwas, coverage = 0.5)
+      # susie_gtex <- coloc::runsusie(coloc_data_gtex, coverage = 0.5)
+      susie_gwas <- runsusie_silently(coloc_data_gwas, coverage = susie_coverage)
+      susie_gtex <- runsusie_silently(coloc_data_gtex, coverage = susie_coverage)
+      if (is.null(susie_gwas) || is.null(susie_gtex)) next
+
+      # run coloc to calculate posterior inclusion probabilities
+      susie.res <- coloc::coloc.susie(susie_gwas, susie_gtex)
+      if (is.null(susie.res$summary)) next
+
+      ## ---- store our results ----
+      # do some rearranging, relabeling, renaming to convert our results into an exportable format
+      locus_data <-
+        tibble(
+          fuma_locus_idx = risk_locus_n,
+          gtex_tissue = tissue_name,
+          gtex_gene = gene_name,
+          gtex_ensembl_id = search_gene,
+          locus_chr = chr,
+          locus_start = min_pos,
+          locus_end = max_pos,
+          locus_min_gwasP = 10^(-(max(locuscompare_data$logp1))),
+          locus_min_gtexP = 10^(-(max(locuscompare_data$logp2))),
+        )
+      # do some matching to convert the credible sets (which are just lists of the indices of snps) to rsid names
+      variant_to_rsid <- locuscompare_names[, c("variant_id_b37", "rsid")] %>% deframe()
+      cs_idx_to_rsid <- function(x) paste(variant_to_rsid[names(x)], collapse = ",")
+      # compile the coloc susie data into an exportable format
+      coloc_susie_data <-
+        susie.res$summary %>%
+        # rename hit1 from variant_id_b37 format to rsid format
+        left_join(locuscompare_names, by = c("hit1" = "variant_id_b37")) %>%
+        relocate("rsid", .after = "hit1") %>%
+        rename("hit1_rsid" = "rsid", "hit1_variant_id_b37" = "hit1") %>%
+        # rename hit2 from variant_id_b37 format to rsid format
+        left_join(locuscompare_names, by = c("hit2" = "variant_id_b37")) %>%
+        relocate("rsid", .after = "hit2") %>%
+        rename("hit2_rsid" = "rsid", "hit2_variant_id_b37" = "hit2") %>%
+        # convert the list of snps in each cs to lists of rsids
+        left_join(
+          summary(susie_gwas)$cs %>%
+            mutate(variable = sapply(susie_gwas$sets$cs, cs_idx_to_rsid)) %>%
+            rename("rsids" = "variable") %>%
+            rename_with(~ paste0("cs1_", str_remove(.x, "^cs_?"))),
+          by = c("idx1" = "cs1_")
+        ) %>%
+        left_join(
+          summary(susie_gtex)$cs %>%
+            mutate(variable = sapply(susie_gtex$sets$cs, cs_idx_to_rsid)) %>%
+            rename("rsids" = "variable") %>%
+            rename_with(~ paste0("cs2_", str_remove(.x, "^cs_?"))),
+          by = c("idx2" = "cs2_")
+        ) %>%
+        # prepend column names with coloc.susie_
+        rename_with(~ paste0("coloc.susie_", .x))
+      # append to our results data frame
+      df_coloc.susie_results %<>% bind_rows(bind_cols(locus_data, coloc_susie_data))
+
+      ## ------------------------------------ plot and save data if PP > 0.8 ------------------------------------
+      if (any(susie.res$summary$PP.H4.abf > 0.8)) {
+        message("         > saving data & plots")
+
+        ## ---- save data ----
+        save_path <-
+          save_path_root %//%
+          str_replace_all(tissue_name, "_", "") %++% "_" %++%
+          "chr" %++% chr %++% "_" %++%
+          "FumaRiskLocus" %++% formatC(risk_locus_n, width = 2, flag = "0")
+        save_name <-
+          str_replace_all(tissue_name, "_", "") %++% "_chr" %++% chr %++% "_" %++% gene_name
+        dir.create(save_path, showWarnings = F, recursive = T)
+        write_rds(susie.res, save_path %//% save_name %++% ".coloc_susie.rds", compress = "gz", compression = 6)
+        write_rds(susie_gwas, save_path %//% save_name %++% ".runsusie_gwas.rds", compress = "gz", compression = 6)
+        write_rds(susie_gtex, save_path %//% save_name %++% ".runsusie_gtex.rds", compress = "gz", compression = 6)
+
+        ## ---- make sensitivity plots for each hit with PP.H4 > 0.8 ----
+        for (i in which(susie.res$summary$PP.H4.abf > 0.8)) {
+          pdf(
+            file = save_path %//% save_name %++% ".coloc_susie.sensitivity_" %++% formatC(i, width = 2, flag = "0") %++% ".pdf",
+            width = 6.5, height = 6.5,
+            title = "coloc-SuSiE Sensitivity Analysis"
+          )
+          suppressMessages(coloc::sensitivity(susie.res, rule = "H4 > 0.8", dataset1 = coloc_data_gwas, dataset2 = coloc_data_gtex, row = i))
+          dev.off()
+        }
+
+        # identify the snp with the max PPH4
+        max_row <- which.max(susie.res$summary$PP.H4.abf)
+        snp_max_susie_PPH4 <- variant_to_rsid[susie.res$results$snp[which.max(susie.res$results %>% pull(max_row + 1))]]
+
+        ## ---- make locuscompare plot with each candidate (FUMA) SNP ----
+        cand_snps_risklocusN <- fuma_cand_snps %>%
+          filter(GenomicLocus == risk_locus_n) %>%
+          pull(rsID)
+        pb <- txtProgressBar(style = 3, min = 0, max = length(cand_snps_risklocusN))
+        for (i in seq_along(cand_snps_risklocusN)) {
+          snp_rsID <- cand_snps_risklocusN[i]
+
+          setTxtProgressBar(pb, i)
+
+          is_lead <- any(str_split_fixed(risk_locus$IndSigSNPs, ";", Inf)[1, ] == snp_rsID)
+          is_maxPPH4 <- (snp_rsID == snp_max_susie_PPH4)
+          targetSNP_in_locus <- any(locuscompare_data$rsid == snp_rsID)
+
+          if (targetSNP_in_locus) {
+            save_name <-
+              str_replace_all(tissue_name, "_", "") %++% "_chr" %++% chr %++% "_" %++% gene_name %++% "_" %++%
+              str_replace_all(snp_rsID, ":", "_") %++% (if (is_lead) "_lead" else "") %++% (if (is_maxPPH4) "_maxPPH4" else "")
+
+            r <- locuscomparer::make_combined_plot(
+              locuscompare_data %>% select(rsid, logp1, logp2, chr, pos),
+              title1 = "Pulsatility GWAS:",
+              title2 = paste0("eQTL ", gene_name, " / ", str_replace_all(tissue_name, "_", " "), ":"),
+              ld = tibble(SNP_A = snp_rsID, SNP_B = colnames(ld_matrix), R2 = ld_matrix[match(snp_rsID, colnames(ld_matrix)), ]^2),
+              chr = chr,
+              snp = snp_rsID,
+              combine = FALSE,
+              legend = FALSE
+            )
+            lc_patchwork <- (r$locuscompare + lc_legend) | (r$locuszoom1 / r$locuszoom2) & theme(axis.text = element_text(color = "black"))
+            suppressMessages(invisible(ajtools::ggfigsave(
+              lc_patchwork,
+              name = save_name,
+              path = save_path,
+              format = c("png", "rds"),
+              overwrite = T,
+              width = 6.5,
+              height = 6.5,
+              dpi = 300
+            )))
+            remove(r, lc_patchwork)
+          }
+        }
+        close(pb)
+      }
+    }
+  }
+}
+
+# post-processing; attach some info from the FUMA file about the genomic risk loci & save to disk
+df_coloc.susie_results %<>%
+  left_join(
+    fuma_risk_loci %>%
+      select(
+        "idx" = GenomicLocus,
+        start, end, nSNPs, LeadSNPs
+      ) %>%
+      rename_with(~ paste0("fuma_locus_", .x)),
+    by = "fuma_locus_idx"
+  ) %>%
+  relocate(starts_with("fuma"), .after = "fuma_locus_idx") %>%
+  write_tsv(ajtools::file_datestamp(basename(save_path_root) %++% "_results.txt.gz", path = save_path_root))
+```
+
+### Load coloc-SuSiE results
+
+```{r}
+df_coloc.susie_results <- vroom(PROJ_ROOT %//% "analyses/coloc_SuSiE_50/coloc_SuSiE_50_results.2021_12_30.txt.gz", show_col_types = F)
+```
+
+## Make table of coloc results
+
+First make separate tables for coloc (single) and coloc-SuSiE
+
+```{r, eval=F}
+coloc_results_table <- function(df, PP.H4, method_label = NULL) {
+  PP.H4 <- as.symbol(PP.H4)
+  method_label <- if (!is.null(method_label)) as.symbol(method_label)
+  nc <- 5 # number of columns on LHS of table
+  df %>%
+    mutate(PP.H4 = {{ PP.H4 }}) %>%
+    distinct(locus_start, locus_end, gtex_tissue, gtex_gene, gtex_ensembl_id, locus_chr, PP.H4, zscore_cor_top5pct) %>%
+    mutate(locus_chr = ordered(locus_chr, levels = c(1:23, "X"), labels = c(1:22, "X", "X"))) %>%
+    # group by genes
+    group_by(gtex_ensembl_id) %>%
+    mutate(max_pph4 = max(PP.H4)) %>%
+    ungroup() %>%
+    # sort by max pph4
+    arrange(-max_pph4, gtex_gene) %>%
+    # combine pph4 and zcor
+    rowwise() %>%
+    mutate(pp_zcor = list(c(PP.H4, zscore_cor_top5pct))) %>%
+    ungroup() %>%
+    select(-PP.H4, -zscore_cor_top5pct) %>%
+    pivot_wider(names_from = gtex_tissue, values_from = pp_zcor, values_fill = list(0, 0)) %>%
+    filter(max_pph4 > 0.5) %>%
+    transmute(
+      "eQTL Gene" = gtex_gene,
+      "eQTL Ensembl ID" = xfun::sans_ext(gtex_ensembl_id),
+      "Locus \nChr." = locus_chr,
+      "Locus\nPosition" = paste0(scibeautify(floor(locus_start)), " ⁠– ", scibeautify(floor(locus_end))),
+      "Maximum\nPosterior\nProbability" = max_pph4,
+      "Aorta" = Artery_Aorta,
+      "Coronary\nArtery" = Artery_Coronary,
+      "Tibial\nArtery" = Artery_Tibial,
+      "Atrial\nAppendage" = Heart_Atrial_Appendage,
+      "Left\nVentricle" = Heart_Left_Ventricle,
+      "Lung" = Lung,
+      "Cultured\nFibroblasts" = Cells_Cultured_fibroblasts,
+    ) %>%
+    flextable::flextable() %>%
+    flextable::align(j = -1, part = "all", align = "center") %>%
+    # alternating row colors
+    # flextable::bg(i = ~ seq_len(nrow(data)) %% 2 == 1, bg = "grey97") %>%
+    # Merged label over tissues
+    flextable::add_header_row(colwidths = c(rep(1, nc), 7), values = c(.$header$col_keys[1:nc], "")) %>%
+    flextable::compose(i = 1, j = -c(1:nc), part = "header", value = as_paragraph(
+      "Tissue PP", as_sub("H4"), " > 0.5", as_sup("§")
+    )) %>%
+    flextable::merge_v(j = 1:nc, part = "header") %>%
+    flextable::hline(i = 1, j = -c(1:nc), part = "header", border = officer::fp_border(width = 1)) %>%
+    # Vertical line between tissues and rest of table
+    flextable::vline(j = nc) %>%
+    # Footer & Symbols
+    flextable::compose(j = "eQTL Gene", part = "header", value = as_paragraph(
+      "eQTL Gene", as_sup("†")
+    )) %>%
+    flextable::add_footer_lines(NA) %>%
+    flextable::compose(part = "footer", value = as_paragraph(
+      "Chr = chromosome, base pair position in GRCh37 coordinates.",
+      "\n",
+      "† Gene names are displayed in HUGO gene nomenclature where available, and as Ensembl IDs otherwise.",
+      "\n",
+      "‡ Posterior probability (PP", as_sub("H4"), ") that there is a shared causal variant in the specified locus for the GWAS and eQTL traits. Only gene-locus pairs with PP", as_sub("H4"), " > 0.5 are displayed. For each gene-locus pair, the maximum PP", as_sub("H4"), " across all tissue types is reported.",
+      "\n",
+      "§ For each tissue type, a check indicates whether the PP", as_sub("H4"), " for the specified gene-locus pair is greater than 0.5."
+    )) %>%
+    flextable::line_spacing(part = "footer", space = 1.5) %>%
+    flextable::align(j = -1, align = "center", part = "all") %>%
+    # PPH4 Format
+    flextable::compose(j = "Maximum\nPosterior\nProbability", part = "header", value = as_paragraph(
+      "Maximum\nPosterior\nProbability", as_sup("‡")
+    )) %>%
+    flextable::compose(j = -c(1:(nc - 1)), part = "body", use_dot = T, value = {
+      pph4_vec <- sapply(., function(x) x[1] %||% 0)
+      zcor_vec <- sapply(., function(x) x[2] %||% NA)
+      zcor_sign <- ifelse(pph4_vec > 0.5 & !is.na(zcor_vec) & zcor_vec^2 > 0.8^2, ifelse(zcor_vec > 0, "+", "–"), NA)
+      as_paragraph(
+        case_when(
+          pph4_vec > 0.999 ~ "> 0.999",
+          pph4_vec < 0.01 ~ "< 0.01",
+          T ~ scibeautify(pph4_vec, 3)
+        ),
+        " ",
+        zcor_sign
+      )
+    }) %>%
+    flextable::bg(j = -c(1:nc), bg = function(x) {
+      x <- sapply(x, function(x) x[1] %||% NA)
+      ifelse(x < 0.5, NA, {
+        rng <- c(0.5, 1)
+        x <- (as.numeric(x) - rng[1]) / (rng[2] - rng[1])
+        ajtools::col_rmp_blue(x)
+      })
+    })
+}
+
+df_coloc_results %>%
+  coloc_results_table("PP.H4") %>%
+  ajtools::flextable_save("table_coloc_single_results_v2", path = PROJ_ROOT %//% "figures", overwrite = T)
+
+# df_coloc.susie_results %>%
+#   coloc_results_table("coloc.susie_PP.H4.abf") %>%
+#   ajtools::flextable_save("table_coloc_SuSiE_results", path = PROJ_ROOT %//% "figures", overwrite = T)
+#
+# df_coloc_results %>%
+#   mutate(method = "single") %>%
+#   bind_rows(df_coloc.susie_results %>% mutate(method = "SuSiE", PP.H4 = coloc.susie_PP.H4.abf)) %>%
+#   coloc_results_table("PP.H4", "method")
+```
