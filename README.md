@@ -15,11 +15,11 @@ Pulmonary Artery Pulsatility (CMR + Deep neural network + UK Biobank)
 
 *April 2022*&nbsp;&nbsp;|&nbsp;&nbsp;*Adam L. Johnson, MD*&nbsp;&nbsp;[✉️](mailto:aljohnson@mgh.harvard.edu)
 
-# Introduction
+## Introduction
 
 This repository contains the code and project structure used in the analysis of pulmonary artery pulsatility by cardiac MRI in the UK Biobank. It is intended to accompany unpublished work currently submitted for peer-review. This repository does **not** contain any raw datasets that were either used by or produced during the analyses – these data files are large, and, in many cases, are restricted by material transfer agreements. Nor does this repository contain any result tables or figures (please refer to the manuscript and supplemental materials for these). The included code is meant to provide implementation details of our methodology, and to encourage reproducibility of our results. The majority of the code is written in either Python or R.
 
-# Note on R dependencies
+## Note on R dependencies
 
 The R code used throughout this project utilizes two custom-built R packages hosted on GitHub:
 
@@ -32,7 +32,7 @@ The second package, _ukbiobank_, was specifically constructed to facilitate the 
 
 Finally, [`notebooks/setup.R`](notebooks/setup.R) performs several initialization tasks common to the `.Rmd` notebooks, such as loading required packages. It also sets the working directory by searching for a parent folder named `ukbb-pulmonary-artery/`.
 
-# Project Layout
+## Project Layout
 
 ```py
 ukbb-pulmonary-artery/
@@ -90,16 +90,16 @@ The general workflow is as follows:
 
     data → notebooks → analyses/results → figures
 
-# Deep learning neural network (DeepCMR)
+## Deep learning neural network (DeepCMR)
 
 The [`DeepCMR/`](DeepCMR/) folder contains Python code and shell scripts for processing DICOM image files with their accompanying manual annotations, performing neural network training and inference, and processing the neural network-generated annotations to calculate segmentation geometries and quality control metrics.
 
 Refer to [`DeepCMR/README.md`](DeepCMR/README.md) for additional documentation about the cardiac MRI and deep learning workflows.
 
-# UK Biobank phenotype data
+## UK Biobank phenotype data
 
 UK Biobank phenotype data was obtained under an approved UK Biobank application. Selected fields were extracted from the raw datafile using `ukbconv`. Data was loaded into R and saved as a .rds file. See https://biobank.ctsu.ox.ac.uk/crystal/exinfo.cgi?src=accessing_data_guide for additional details.
 
-# Contact
+## Contact
 
 Please contact Adam L. Johnson (aljohnson@mgh.harvard.edu) with any questions pertaining to this project.
