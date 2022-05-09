@@ -19,6 +19,8 @@ Pulmonary Artery Pulsatility (CMR + Deep neural network + UK Biobank)
 
 ## Introduction
 
+![](DeepCMR/pa_pulsatility.gif)
+
 This repository contains the code and project structure used in the analysis of pulmonary artery pulsatility by cardiac MRI in the UK Biobank. It is intended to accompany unpublished work currently submitted for peer-review. This repository does **not** contain any raw datasets that were either used by or produced during the analyses – these data files are large, and, in many cases, are restricted by material transfer agreements. Nor does this repository contain any result tables or figures (please refer to the manuscript and supplemental materials for these). The included code is meant to provide implementation details of our methodology, and to encourage reproducibility of our results. The majority of the code is written in either Python or R.
 
 ## Note on R dependencies
