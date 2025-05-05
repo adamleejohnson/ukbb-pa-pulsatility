@@ -3,6 +3,7 @@ Pulmonary Artery Pulsatility (CMR + Deep neural network + UK Biobank)
 
 ![R](https://img.shields.io/badge/R-276DC3?style=plastic&logo=r&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3670A0?style=plastic&logo=python&logoColor=ffdd54)
+![code_size](https://img.shields.io/github/languages/code-size/adamleejohnson/ukbb-pa-pulsatility)
 
 ### Table of Contents
 - [Introduction](#introduction)
